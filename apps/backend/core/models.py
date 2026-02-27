@@ -4,6 +4,15 @@ from django.db import models
 
 class AthleteProfile(models.Model):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    display_name = models.CharField(max_length=128, blank=True)
+    age = models.PositiveIntegerField(null=True, blank=True)
+    height_cm = models.FloatField(null=True, blank=True)
+    weight_kg = models.FloatField(null=True, blank=True)
+    primary_sport = models.CharField(max_length=32, blank=True)
+    current_race_pace = models.CharField(max_length=32, blank=True)
+    goal_race_pace = models.CharField(max_length=32, blank=True)
+    goal_event_name = models.CharField(max_length=128, blank=True)
+    goal_event_date = models.DateField(null=True, blank=True)
     goals = models.CharField(max_length=255, blank=True)
     schedule = models.JSONField(default=dict, blank=True)
     constraints = models.TextField(blank=True)
@@ -11,6 +20,7 @@ class AthleteProfile(models.Model):
     experience_level = models.CharField(max_length=64, blank=True)
     preferred_sports = models.JSONField(default=list, blank=True)
     weekly_target_hours = models.FloatField(default=0)
+    hr_zones = models.JSONField(default=list, blank=True)
 
 
 class StravaConnection(models.Model):
@@ -90,3 +100,40 @@ class NotificationSettings(models.Model):
     telegram_chat_id = models.CharField(max_length=64, blank=True)
     daily_summary_enabled = models.BooleanField(default=False)
     weekly_summary_enabled = models.BooleanField(default=False)
+
+
+class TelegramConnection(models.Model):
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    telegram_chat_id = models.CharField(max_length=64, blank=True)
+    telegram_user_id = models.CharField(max_length=64, blank=True)
+    telegram_username = models.CharField(max_length=128, blank=True)
+    setup_code = models.CharField(max_length=32, blank=True)
+    setup_code_expires_at = models.DateTimeField(null=True, blank=True)
+    last_update_id = models.BigIntegerField(default=0)
+    connected_at = models.DateTimeField(null=True, blank=True)
+    last_verified_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class AIInteraction(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    mode = models.CharField(max_length=64)
+    source = models.CharField(max_length=32, default="unknown")
+    model = models.CharField(max_length=64, blank=True)
+    status = models.CharField(max_length=32, default="success")
+    error_message = models.TextField(blank=True)
+    max_chars = models.IntegerField(default=160)
+    response_text = models.TextField(blank=True)
+    prompt_system = models.TextField(blank=True)
+    prompt_user = models.TextField(blank=True)
+    prompt_messages_json = models.JSONField(default=list, blank=True)
+    context_snapshot_json = models.JSONField(default=dict, blank=True)
+    context_hash = models.CharField(max_length=64, blank=True)
+    request_params_json = models.JSONField(default=dict, blank=True)
+    related_activity = models.ForeignKey(Activity, null=True, blank=True, on_delete=models.SET_NULL)
+    related_training_plan = models.ForeignKey(TrainingPlan, null=True, blank=True, on_delete=models.SET_NULL)
+    tokens_input = models.IntegerField(null=True, blank=True)
+    tokens_output = models.IntegerField(null=True, blank=True)
+    cost_estimate = models.FloatField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)

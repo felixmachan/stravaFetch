@@ -1,32 +1,56 @@
 # PacePilot
 
-PacePilot is a full-stack AI coach for Strava (Run/Ride/Swim) built with Django + DRF + Celery + Postgres + Redis and React + Vite.
+PacePilot is a full-stack Strava coaching app built with Django/DRF/Celery (backend) and React/Vite/Tailwind (frontend).
 
-## Quick start
-1. Create Strava API app and set callback URL to `http://localhost:8000/api/auth/strava/callback`.
-2. Copy `.env.example` to `.env` and fill keys.
-3. Start stack: `docker-compose up --build`.
-4. Open web on http://localhost:5173 and login with `admin@local` / `admin`.
-5. Click Connect Strava.
+## Local quick start
+1. Copy `.env.example` -> `.env` and set Strava keys.
+2. Backend (`apps/backend`):
+   - `pip install -r requirements.txt`
+   - `python app.py` (runs migrations, ensures `admin@local` user, starts on `http://localhost:8000`)
+3. Frontend (`apps/web`):
+   - `npm install`
+   - `npm run dev` (starts on `http://localhost:5173`)
 
-## What works
-- Polling sync via Celery Beat (`STRAVA_POLL_INTERVAL_MINUTES`).
-- Strava OAuth connect/callback + token refresh.
-- Activity ingestion (idempotent upsert by `strava_activity_id`).
-- AI coach note generation with strict JSON validation + deterministic fallback.
-- Dashboard, activities list, activity detail, basic map/chart.
-- Integrations endpoints for Email + Telegram and test send.
-- Webhook endpoints exist at `/api/strava/webhook` (GET verify, POST receive).
+## Auth model (dev-friendly JWT)
+- `POST /api/auth/dev-login` (debug-only): returns access/refresh JWTs for `admin@local` (`admin`).
+- `POST /api/auth/login`: username/email + password -> tokens.
+- `POST /api/auth/refresh`: refresh token -> new access token.
+- `GET /api/auth/me`: current user + Strava connection status.
 
-## Webhook (optional)
-For local webhook testing expose backend using ngrok/cloudflared and register in Strava developer settings to `/api/strava/webhook` with `STRAVA_VERIFY_TOKEN`.
+Frontend stores JWT tokens and automatically sends `Authorization: Bearer <token>` on protected requests.
+On `401`, it attempts token refresh automatically.
 
-## Commands
-- Migrations: `docker-compose run --rm backend python manage.py migrate`
-- Create superuser: `docker-compose run --rm backend python manage.py createsuperuser`
-- Tests: `docker-compose run --rm backend python manage.py test`
+## Strava OAuth flow
+1. In web app, go to Integrations and click **Connect Strava**.
+2. Frontend calls `GET /api/auth/strava/connect` (authenticated) and receives Strava authorize URL.
+3. Browser redirects to Strava consent.
+4. Strava returns to `STRAVA_REDIRECT_URI` (`/api/auth/strava/callback`).
+5. Backend exchanges code for tokens, stores in `StravaConnection` for the authenticated user (state-validated), then redirects to:
+   - `${APP_BASE_URL}/integrations?strava=connected`
 
-## Notes
-- Tokens are stored server-side only.
-- CSRF/session auth enabled, CORS restricted to localhost:5173.
-- Demo mode: you can POST sample activity JSON through API directly if Strava is not connected.
+Disconnect endpoint:
+- `POST /api/auth/strava/disconnect`
+
+## Demo data
+If no Strava data exists, import a sample workout:
+- `POST /api/demo/import`
+
+This creates one activity with streams + derived metrics to populate dashboard charts, map preview, and activity detail UI.
+
+## What is implemented
+- Working one-click dev login with visible logged-in state.
+- Working authenticated Strava connect/callback/disconnect flow.
+- Premium app shell: top bar, sidebar, theme toggle, responsive cards.
+- Dashboard analytics: trend cards, training load chart, weekly sport chart, coach tone, weekly focus, ramp warning, streak, readiness placeholder, next workout.
+- Activities list: search/filter UI with richer cards.
+- Activity detail: map route, HR/elevation charts, splits, AI note panel + regenerate action.
+- Global API error toasts and loading/empty states.
+
+## Environment notes
+Required Strava env vars:
+- `STRAVA_CLIENT_ID`
+- `STRAVA_CLIENT_SECRET`
+- `STRAVA_REDIRECT_URI` (must match your Strava app callback)
+
+Frontend base URL:
+- `VITE_API_BASE_URL` (default `http://localhost:8000/api`)

@@ -1,2 +1,60 @@
-@tailwind base;@tailwind components;@tailwind utilities;
-body{font-family:Inter,system-ui,sans-serif}.card{@apply bg-slate-900 rounded-xl p-4 border border-slate-700}.btn{@apply bg-cyan-500 text-black px-4 py-2 rounded}
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 210 35% 97%;
+  --foreground: 224 23% 12%;
+  --card: 0 0% 100%;
+  --muted: 210 24% 92%;
+  --muted-foreground: 217 15% 40%;
+  --border: 214 24% 83%;
+  --primary: 153 74% 35%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 213 31% 90%;
+  --secondary-foreground: 224 23% 12%;
+}
+
+.dark {
+  --background: 220 26% 9%;
+  --foreground: 210 40% 98%;
+  --card: 222 23% 13%;
+  --muted: 220 21% 18%;
+  --muted-foreground: 216 16% 69%;
+  --border: 220 20% 24%;
+  --primary: 153 68% 45%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 223 18% 22%;
+  --secondary-foreground: 210 40% 98%;
+}
+
+* {
+  @apply border-border;
+}
+
+body {
+  @apply bg-background text-foreground antialiased;
+  font-family: 'Plus Jakarta Sans', 'Segoe UI', sans-serif;
+}
+
+.bg-app-gradient {
+  background-image:
+    radial-gradient(circle at 10% 10%, rgba(34, 197, 94, 0.2), transparent 35%),
+    radial-gradient(circle at 90% 20%, rgba(14, 165, 233, 0.18), transparent 30%),
+    linear-gradient(180deg, hsl(var(--background)), hsl(var(--background)));
+}
+
+.leaflet-container {
+  @apply rounded-xl;
+  z-index: 1;
+}
+
+.leaflet-pane,
+.leaflet-control {
+  z-index: 400;
+}
+
+.leaflet-top,
+.leaflet-bottom {
+  z-index: 500;
+}
