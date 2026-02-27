@@ -137,3 +137,23 @@ class AIInteraction(models.Model):
     tokens_output = models.IntegerField(null=True, blank=True)
     cost_estimate = models.FloatField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+class AIFeatureCache(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    feature = models.CharField(max_length=64)
+    cache_key = models.CharField(max_length=255)
+    input_hash = models.CharField(max_length=64, blank=True)
+    payload_json = models.JSONField(default=dict, blank=True)
+    model = models.CharField(max_length=64, blank=True)
+    tokens_input = models.IntegerField(null=True, blank=True)
+    tokens_output = models.IntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "feature", "cache_key")
+        indexes = [
+            models.Index(fields=["user", "feature", "cache_key"]),
+            models.Index(fields=["updated_at"]),
+        ]

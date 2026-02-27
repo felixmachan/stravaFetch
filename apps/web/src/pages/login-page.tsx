@@ -34,6 +34,11 @@ export function LoginPage() {
   const [mode, setMode] = useState<Mode>('login');
   const [busy, setBusy] = useState(false);
   const [stravaBusy, setStravaBusy] = useState(false);
+  const [registerProgress, setRegisterProgress] = useState(0);
+  const [onboardingGate, setOnboardingGate] = useState(false);
+  const [registerBackendMessage, setRegisterBackendMessage] = useState('');
+  const [registerHintText, setRegisterHintText] = useState('');
+  const [registerStatusTick, setRegisterStatusTick] = useState(0);
   const [error, setError] = useState('');
   const [stravaLinkedForSignup, setStravaLinkedForSignup] = useState(false);
   const [stravaAvatar, setStravaAvatar] = useState('');
@@ -109,7 +114,7 @@ export function LoginPage() {
     };
   }, [searchParams, setSearchParams]);
 
-  if (!loading && isAuthenticated) {
+  if (!loading && isAuthenticated && !onboardingGate) {
     return <Navigate to='/' replace />;
   }
 
@@ -122,6 +127,88 @@ export function LoginPage() {
     if (registerForm.goal_type === 'annual_km') return Boolean(registerForm.annual_km_goal);
     return true;
   }, [registerForm]);
+  const registerBusy = mode === 'register' && (busy || onboardingGate);
+  const registerHints = useMemo(() => {
+    if (registerProgress < 20) return ['Creating athlete profile...', 'Setting up secure account context...'];
+    if (registerProgress < 45) return ['Evaluating your athlete identity...', 'Checking your current pace baseline...'];
+    if (registerProgress < 70) return ['Syncing latest Strava activities...', 'Analyzing available HR context...'];
+    if (registerProgress < 88) return ['Creating your training plan...', 'Balancing load and recovery...'];
+    return ['Finalizing your week plan...', 'Preparing your dashboard and coach notes...'];
+  }, [registerProgress]);
+  const registerStatus = useMemo(() => {
+    if (registerBackendMessage) return registerBackendMessage;
+    if (registerProgress < 12) return 'Creating your account...';
+    if (registerProgress < 28) return 'Evaluating your athlete identity...';
+    if (registerProgress < 45) return 'Checking your current pace baseline...';
+    if (registerProgress < 62) return 'Analyzing available heart-rate context...';
+    if (registerProgress < 78) return 'Generating your weekly structure...';
+    if (registerProgress < 92) return 'Finalizing your training plan...';
+    return 'Almost done. Preparing your dashboard...';
+  }, [registerProgress]);
+
+  useEffect(() => {
+    if (!registerBusy) {
+      setRegisterProgress(0);
+      setRegisterHintText('');
+      setRegisterBackendMessage('');
+      return;
+    }
+    let pct = 4;
+    setRegisterProgress(pct);
+    const t = setInterval(() => {
+      const step = Math.max(1, Math.ceil((100 - pct) / 8));
+      pct = Math.min(96, pct + step);
+      setRegisterProgress(pct);
+    }, 1400);
+    return () => clearInterval(t);
+  }, [registerBusy]);
+
+  useEffect(() => {
+    if (!registerBusy) return;
+    const t = setInterval(() => setRegisterStatusTick((v) => v + 1), 2200);
+    return () => clearInterval(t);
+  }, [registerBusy]);
+
+  useEffect(() => {
+    if (!registerBusy) return;
+    const options = registerHints;
+    if (!options.length) return;
+    setRegisterHintText(options[registerStatusTick % options.length]);
+  }, [registerHints, registerBusy, registerStatusTick]);
+
+  useEffect(() => {
+    if (!onboardingGate || !isAuthenticated) return;
+    let mounted = true;
+    let stopped = false;
+
+    const poll = async () => {
+      while (!stopped && mounted) {
+        try {
+          const res = await api.get('/auth/onboarding-status', { suppressToast: true } as any);
+          const data = res.data || {};
+          if (!mounted || stopped) return;
+          const pct = Math.max(1, Math.min(100, Number(data.progress || 0)));
+          setRegisterProgress(pct);
+          setRegisterBackendMessage(String(data.message || 'Preparing your training setup...'));
+          if (data.ready) {
+            setRegisterProgress(100);
+            setOnboardingGate(false);
+            navigate('/');
+            return;
+          }
+        } catch {
+          // Keep modal visible and continue polling.
+        }
+        await new Promise((r) => setTimeout(r, 2500));
+      }
+    };
+    poll();
+
+    return () => {
+      mounted = false;
+      stopped = true;
+    };
+  }, [onboardingGate, isAuthenticated, navigate]);
 
   async function submitLogin() {
     setError('');
@@ -163,6 +250,7 @@ export function LoginPage() {
   async function submitRegister() {
     setError('');
     setBusy(true);
+    setRegisterProgress(6);
     try {
       await register({
         ...registerForm,
@@ -173,9 +261,11 @@ export function LoginPage() {
         annual_km_goal: registerForm.annual_km_goal ? Number(registerForm.annual_km_goal) : null,
         ai_memory_days: registerForm.ai_memory_days ? Number(registerForm.ai_memory_days) : 30,
       });
-      navigate('/profile');
+      setOnboardingGate(true);
+      setRegisterProgress((p) => Math.max(p, 14));
     } catch (e: any) {
       setError(e?.response?.data?.detail || 'Registration failed.');
+      setOnboardingGate(false);
     } finally {
       setBusy(false);
     }
@@ -422,6 +512,28 @@ export function LoginPage() {
           )}
         </Card>
       </div>
+      {registerBusy && (
+        <div className='fixed inset-0 z-[2500] grid place-items-center bg-slate-950/80 px-4'>
+          <div className='w-full max-w-xl rounded-2xl border border-cyan-400/30 bg-slate-950/95 p-6 shadow-2xl backdrop-blur-sm'>
+            <p className='text-2xl font-semibold text-cyan-100'>Generating your plan...</p>
+            <p className='mt-1 text-sm text-slate-300'>Please keep this page open while onboarding finishes.</p>
+            <div className='mt-5'>
+              <div className='mb-1 flex items-center justify-between text-sm'>
+                <span className='text-slate-300'>Progress</span>
+                <span className='font-semibold text-cyan-200'>{registerProgress}%</span>
+              </div>
+              <div className='h-3 w-full overflow-hidden rounded-full border border-cyan-300/20 bg-slate-900'>
+                <div
+                  className='h-full rounded-full bg-gradient-to-r from-emerald-400 via-cyan-400 to-sky-400 transition-all duration-1000'
+                  style={{ width: `${registerProgress}%` }}
+                />
+              </div>
+            </div>
+            <p className='mt-4 text-sm text-cyan-100/90'>{registerStatus}</p>
+            <p className='mt-1 text-xs text-cyan-100/70'>{registerHintText}</p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

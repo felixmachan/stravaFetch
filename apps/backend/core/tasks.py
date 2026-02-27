@@ -5,7 +5,8 @@ from celery import shared_task
 from django.contrib.auth.models import User
 from django.core.mail import send_mail
 from django.utils import timezone
-from .models import Activity, ActivityStream, AthleteProfile, DerivedMetrics, NotificationSettings, StravaConnection
+from .models import Activity, ActivityStream, AthleteProfile, CoachNote, DerivedMetrics, NotificationSettings, StravaConnection
+from .services.ai import refresh_weekly_artifacts
 from .services.coaching_engine import deterministic_metrics
 from .services.ai_coach import (
     generate_activity_reaction as generate_activity_reaction_service,
@@ -44,33 +45,44 @@ def generate_coach_tone_task(user_id):
 
 
 @shared_task
+def refresh_weekly_artifacts_task(user_id):
+    user = User.objects.get(id=user_id)
+    return refresh_weekly_artifacts(user)
+
+
+@shared_task
 def generate_activity_reaction_task(activity_id, user_id):
     user = User.objects.get(id=user_id)
     activity = Activity.objects.get(id=activity_id, user=user)
-    return generate_activity_reaction_service(user, activity)
+    result = generate_activity_reaction_service(user, activity)
+    refresh_weekly_artifacts_task.delay(user.id)
+    return result
 
 
 @shared_task
 def sync_now_for_user(user_id):
     user = User.objects.get(id=user_id)
     conn = StravaConnection.objects.get(user=user)
+    profile, _ = AthleteProfile.objects.get_or_create(user=user)
+    schedule = profile.schedule or {}
+    onboarding = schedule.get("onboarding", {})
+    onboarding["sync_in_progress"] = True
+    onboarding["full_sync_complete"] = False
+    schedule["onboarding"] = onboarding
+    profile.schedule = schedule
+    profile.save(update_fields=["schedule"])
     token = refresh_if_needed(conn)
-    AthleteProfile.objects.get_or_create(user=user)
     try:
         sync_athlete_profile_from_connection(user, conn, force=False)
     except Exception:
         pass
-    initial_days = int(os.getenv('STRAVA_INITIAL_SYNC_DAYS', '30'))
-    if conn.last_sync_at:
-        after = int(conn.last_sync_at.timestamp())
-    elif initial_days <= 0:
-        after = 0
-    else:
-        after = int((timezone.now() - dt.timedelta(days=initial_days)).timestamp())
+    # Always perform full history sync from Strava.
+    after = 0
 
     fetched = 0
     upserted = 0
     new_activities = 0
+    reaction_cutoff = timezone.now() - dt.timedelta(days=10)
     page = 1
     per_page = 100
     while True:
@@ -101,7 +113,8 @@ def sync_now_for_user(user_id):
             upserted += 1
             if created:
                 new_activities += 1
-                generate_activity_reaction_task.delay(obj.id, user.id)
+                if obj.start_date >= reaction_cutoff:
+                    generate_activity_reaction_task.delay(obj.id, user.id)
 
         if len(items) < per_page:
             break
@@ -110,8 +123,36 @@ def sync_now_for_user(user_id):
     conn.last_sync_at = timezone.now()
     conn.last_polled_at = timezone.now()
     conn.save(update_fields=['last_sync_at', 'last_polled_at'])
+
+    # Ensure last 10 days are fully covered by AI reactions, not only newly created rows.
+    cutoff_recent = timezone.now() - dt.timedelta(days=10)
+    recent_ids = list(
+        Activity.objects.filter(user=user, is_deleted=False, start_date__gte=cutoff_recent).values_list("id", flat=True)
+    )
+    noted_ids = set(
+        CoachNote.objects.filter(activity_id__in=recent_ids).values_list("activity_id", flat=True).distinct()
+    ) if recent_ids else set()
+    for aid in recent_ids:
+        if aid not in noted_ids:
+            generate_activity_reaction_task.delay(aid, user.id)
+
+    profile, _ = AthleteProfile.objects.get_or_create(user=user)
+    schedule = profile.schedule or {}
+    onboarding = schedule.get("onboarding", {})
+    onboarding["sync_in_progress"] = False
+    onboarding["full_sync_complete"] = True
+    onboarding["last_full_sync_at"] = timezone.now().isoformat()
+    onboarding["last_sync_result"] = {
+        "fetched": fetched,
+        "upserted": upserted,
+        "new_activities": new_activities,
+    }
+    schedule["onboarding"] = onboarding
+    profile.schedule = schedule
+    profile.save(update_fields=["schedule"])
     if new_activities > 0:
         generate_coach_tone_task.delay(user.id)
+        refresh_weekly_artifacts_task.delay(user.id)
     return {'rate_limited': False, 'fetched': fetched, 'upserted': upserted, 'new_activities': new_activities}
 
 

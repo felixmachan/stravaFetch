@@ -2,6 +2,7 @@ import datetime as dt
 import json
 import os
 import secrets
+import threading
 from urllib.parse import urlencode
 
 import requests
@@ -38,6 +39,7 @@ from .services.ai_coach import (
     refresh_week_plan_status,
     run_ai_and_log,
 )
+from .services.ai import answer_general_chat, generate_quick_encouragement, generate_weekly_summary
 from .services.strava import refresh_if_needed, sync_athlete_profile_from_connection, sync_athlete_profile_from_strava
 from .tasks import (
     generate_activity_reaction_task,
@@ -48,6 +50,11 @@ from .tasks import (
     sync_now_for_user,
     sync_streams_for_activity,
 )
+
+
+def _run_background(task):
+    t = threading.Thread(target=task, daemon=True)
+    t.start()
 
 
 def _token_pair(user: User) -> dict:
@@ -199,6 +206,14 @@ def _profile_from_payload(user: User, payload: dict):
     if payload.get("ai_memory_days") is not None:
         ai = schedule.get("ai_settings", {})
         ai["memory_days"] = int(payload.get("ai_memory_days") or 30)
+        ai["lookback_days"] = int(payload.get("ai_lookback_days") or ai.get("lookback_days") or ai["memory_days"])
+        ai["feature_flags"] = ai.get("feature_flags") or {
+            "weekly_plan": True,
+            "coach_says": True,
+            "weekly_summary": True,
+            "general_chat": True,
+            "quick_encouragement": True,
+        }
         schedule["ai_settings"] = ai
     profile.schedule = schedule
     profile.save(update_fields=["schedule"])
@@ -381,8 +396,19 @@ def register_view(request):
         if not request.data.get("goal_distance_km"):
             return Response({"detail": "Race goal requires race distance (km)."}, status=400)
     user = User.objects.create_user(username=username, email=email, password=password)
-    _profile_from_payload(user, request.data)
+    profile = _profile_from_payload(user, request.data)
+    schedule = profile.schedule or {}
+    schedule["onboarding"] = {
+        "sync_in_progress": False,
+        "full_sync_complete": False,
+        "last_full_sync_at": None,
+    }
+    profile.schedule = schedule
+    profile.save(update_fields=["schedule"])
     signup_token = (request.data.get("strava_signup_token") or "").strip()
+    if not signup_token:
+        user.delete()
+        return Response({"detail": "Strava signup is required. Connect Strava first."}, status=400)
     if signup_token:
         try:
             signup_payload = signing.loads(signup_token, salt="strava-signup-token", max_age=30 * 60)
@@ -404,7 +430,7 @@ def register_view(request):
                 sync_athlete_profile_from_strava(user, signup_payload.get("access_token"), force=True)
             except Exception:
                 pass
-            inline_sync = settings.DEBUG or os.getenv("STRAVA_SYNC_INLINE_ON_CONNECT", "0") == "1"
+            inline_sync = os.getenv("STRAVA_SYNC_INLINE_ON_CONNECT", "0") == "1"
             if inline_sync:
                 try:
                     sync_now_for_user(user.id)
@@ -414,11 +440,81 @@ def register_view(request):
                 sync_now_for_user.delay(user.id)
         except Exception:
             pass
-    try:
-        generate_onboarding_summary(user)
-    except Exception:
-        pass
+    _run_background(lambda: generate_onboarding_summary(user, bootstrap_last_n=10))
+    _run_background(lambda: generate_weekly_plan(user, force=True, bootstrap_last_n=10))
     return Response({"tokens": _token_pair(user), "user": _user_payload(user)}, status=201)
+
+
+@api_view(["GET"])
+def onboarding_status_view(request):
+    user = request.user
+    strava = StravaConnection.objects.filter(user=user).first()
+    profile, _ = AthleteProfile.objects.get_or_create(user=user)
+    onboarding = (profile.schedule or {}).get("onboarding") or {}
+    has_strava = bool(strava)
+    full_sync_complete = bool(onboarding.get("full_sync_complete"))
+    sync_in_progress = bool(onboarding.get("sync_in_progress"))
+    has_onboarding = AIInteraction.objects.filter(user=user, mode="onboarding", status="success").exists()
+
+    next_week_start = (timezone.localdate() - dt.timedelta(days=timezone.localdate().weekday())) + dt.timedelta(days=7)
+    next_week_end = next_week_start + dt.timedelta(days=6)
+    next_plan = TrainingPlan.objects.filter(user=user, status="active", start_date=next_week_start, end_date=next_week_end).first()
+    plan_source = str((next_plan.plan_json or {}).get("source") or "") if next_plan else ""
+    plan_generated_by_ai = bool(next_plan and plan_source not in {"fallback", "fallback_current_week", "fallback_current_week", "unknown"})
+
+    recent_cutoff = timezone.now() - dt.timedelta(days=10)
+    recent_activity_ids = list(
+        Activity.objects.filter(user=user, is_deleted=False, start_date__gte=recent_cutoff).values_list("id", flat=True)
+    )
+    recent_count = len(recent_activity_ids)
+    ai_reaction_count = (
+        CoachNote.objects.filter(activity_id__in=recent_activity_ids).values("activity_id").distinct().count()
+        if recent_activity_ids
+        else 0
+    )
+    recent_ai_complete = recent_count == ai_reaction_count
+
+    progress = 8
+    message = "Creating account"
+    if has_strava:
+        progress = 20
+        message = "Connected Strava"
+    if has_strava and not full_sync_complete:
+        progress = 45
+        message = "Syncing all Strava activities"
+    if full_sync_complete:
+        progress = 62
+        message = "All Strava data loaded"
+    if plan_generated_by_ai:
+        progress = 80
+        message = "Weekly AI plan generated"
+    if recent_ai_complete:
+        progress = max(progress, 92)
+        message = "AI notes created for last 10 days"
+    if has_onboarding:
+        progress = max(progress, 96)
+        message = "Finalizing dashboard context"
+
+    ready = bool(has_strava and full_sync_complete and plan_generated_by_ai and recent_ai_complete and has_onboarding)
+    if ready:
+        progress = 100
+        message = "Onboarding complete"
+
+    return Response(
+        {
+            "ready": ready,
+            "progress": progress,
+            "message": message,
+            "has_strava": has_strava,
+            "full_sync_complete": full_sync_complete,
+            "sync_in_progress": sync_in_progress,
+            "next_week_plan_ready": plan_generated_by_ai,
+            "recent_ai_complete": recent_ai_complete,
+            "recent_activity_count_10d": recent_count,
+            "recent_ai_note_count_10d": ai_reaction_count,
+            "has_onboarding": has_onboarding,
+        }
+    )
 
 
 @api_view(["POST"])
@@ -459,6 +555,14 @@ def refresh_view(request):
 def logout_view(_request):
     logout(_request)
     return Response({"ok": True})
+
+
+@api_view(["DELETE", "POST"])
+def delete_account_view(request):
+    user = request.user
+    username = user.username
+    user.delete()
+    return Response({"ok": True, "deleted_username": username})
 
 
 @api_view(["GET"])
@@ -814,20 +918,48 @@ def ai_settings(request):
     p, _ = AthleteProfile.objects.get_or_create(user=request.user)
     schedule = p.schedule or {}
     ai = schedule.get("ai_settings", {})
+    feature_flags = ai.get("feature_flags", {})
     if request.method == "PATCH":
         ai["memory_days"] = int(request.data.get("memory_days") or ai.get("memory_days") or 30)
+        ai["lookback_days"] = int(request.data.get("lookback_days") or ai.get("lookback_days") or ai["memory_days"] or 15)
         ai["max_reply_chars"] = int(request.data.get("max_reply_chars") or ai.get("max_reply_chars") or 160)
-        ai["ai_model"] = str(request.data.get("ai_model") or ai.get("ai_model") or os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-        ai["weekly_plan_enabled"] = bool(request.data.get("weekly_plan_enabled", ai.get("weekly_plan_enabled", True)))
+        ai["ai_model"] = str(request.data.get("ai_model") or ai.get("ai_model") or os.getenv("OPENAI_MODEL", "gpt-5-mini"))
+        ai["weekly_plan_enabled"] = _as_bool(request.data.get("weekly_plan_enabled", ai.get("weekly_plan_enabled", True)))
+        if "feature_flags" in request.data and isinstance(request.data.get("feature_flags"), dict):
+            incoming = request.data.get("feature_flags") or {}
+            feature_flags.update(
+                {
+                    "weekly_plan": _as_bool(incoming.get("weekly_plan", feature_flags.get("weekly_plan", True))),
+                    "coach_says": _as_bool(incoming.get("coach_says", feature_flags.get("coach_says", True))),
+                    "weekly_summary": _as_bool(incoming.get("weekly_summary", feature_flags.get("weekly_summary", True))),
+                    "general_chat": _as_bool(incoming.get("general_chat", feature_flags.get("general_chat", True))),
+                    "quick_encouragement": _as_bool(incoming.get("quick_encouragement", feature_flags.get("quick_encouragement", True))),
+                }
+            )
+        ai["feature_flags"] = {
+            "weekly_plan": _as_bool(request.data.get("enable_weekly_plan", feature_flags.get("weekly_plan", True))),
+            "coach_says": _as_bool(request.data.get("enable_coach_says", feature_flags.get("coach_says", True))),
+            "weekly_summary": _as_bool(request.data.get("enable_weekly_summary", feature_flags.get("weekly_summary", True))),
+            "general_chat": _as_bool(request.data.get("enable_general_chat", feature_flags.get("general_chat", True))),
+            "quick_encouragement": _as_bool(request.data.get("enable_quick_encouragement", feature_flags.get("quick_encouragement", True))),
+        }
         schedule["ai_settings"] = ai
         p.schedule = schedule
         p.save(update_fields=["schedule"])
     return Response(
         {
             "memory_days": int(ai.get("memory_days") or 30),
+            "lookback_days": int(ai.get("lookback_days") or ai.get("memory_days") or 15),
             "max_reply_chars": int(ai.get("max_reply_chars") or 160),
-            "ai_model": str(ai.get("ai_model") or os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
+            "ai_model": str(ai.get("ai_model") or os.getenv("OPENAI_MODEL", "gpt-5-mini")),
             "weekly_plan_enabled": bool(ai.get("weekly_plan_enabled", True)),
+            "feature_flags": {
+                "weekly_plan": bool((ai.get("feature_flags") or {}).get("weekly_plan", True)),
+                "coach_says": bool((ai.get("feature_flags") or {}).get("coach_says", True)),
+                "weekly_summary": bool((ai.get("feature_flags") or {}).get("weekly_summary", True)),
+                "general_chat": bool((ai.get("feature_flags") or {}).get("general_chat", True)),
+                "quick_encouragement": bool((ai.get("feature_flags") or {}).get("quick_encouragement", True)),
+            },
         }
     )
 
@@ -876,6 +1008,17 @@ def ai_history(request):
     return Response(out)
 
 
+@api_view(["GET"])
+def ai_weekly_summary(request):
+    return Response(generate_weekly_summary(request.user))
+
+
+@api_view(["GET"])
+def ai_quick_encouragement(request):
+    payload = generate_quick_encouragement(request.user)
+    return Response(payload)
+
+
 @api_view(["POST"])
 def ai_ask(request):
     p, _ = AthleteProfile.objects.get_or_create(user=request.user)
@@ -897,36 +1040,33 @@ def ai_ask(request):
         related_activity=related_activity,
         include_recent_ai_hour=include_recent_ai_hour,
     )
-    system_prompt = (
-        f"You are a concise endurance coach. Reply in practical and specific style. Never exceed {max_chars} characters. "
-        "If the question mentions shoes/gear/equipment, use the provided gear context explicitly (name, distance, primary) before giving advice."
-    )
-    if mode == "onboarding":
-        system_prompt += " Keep it brief and actionable."
-    elif mode == "activity":
-        system_prompt += " Focus on load, recovery, and next action in one sentence."
-    elif mode == "goal_quick_opinion":
-        system_prompt += " Give 3-4 short sentences."
-    user_prompt = (
-        f"Mode={mode}. Max chars={max_chars}. "
-        f"Context={json.dumps(context, ensure_ascii=False)}. "
-        f"Question={question}"
-    )
-    result = run_ai_and_log(
-        user=request.user,
-        mode=mode,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        max_chars=max_chars,
-        context_snapshot=context,
-        related_activity=related_activity,
-        request_params={
-            "memory_days": memory_days,
-            "max_chars": max_chars,
-            "question": question,
-            "include_recent_ai_hour": include_recent_ai_hour,
-        },
-    )
+    if mode == "general_chat":
+        result = answer_general_chat(request.user, question, max_chars=max_chars)
+    else:
+        system_prompt = (
+            f"You are a concise endurance coach. Reply in practical and specific style. Never exceed {max_chars} characters. "
+            "If the question mentions shoes/gear/equipment, use the provided gear context explicitly before giving advice."
+        )
+        user_prompt = (
+            f"Mode={mode}. Max chars={max_chars}. "
+            f"Context={json.dumps(context, ensure_ascii=False)}. "
+            f"Question={question}"
+        )
+        result = run_ai_and_log(
+            user=request.user,
+            mode=mode,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_chars=max_chars,
+            context_snapshot=context,
+            related_activity=related_activity,
+            request_params={
+                "memory_days": memory_days,
+                "max_chars": max_chars,
+                "question": question,
+                "include_recent_ai_hour": include_recent_ai_hour,
+            },
+        )
     answer = result["answer"]
     source = result["source"]
     memory = schedule.get("ai_memory", [])
@@ -1015,7 +1155,10 @@ def generate_week_plan(request):
 def coach_tone_view(request):
     try:
         row = AIInteraction.objects.filter(user=request.user, mode="coach_tone").order_by("-created_at").values("id", "response_text", "source", "created_at").first()
-        return Response(row or {"response_text": "", "source": "n/a"})
+        if row:
+            return Response(row)
+        quick = generate_quick_encouragement(request.user)
+        return Response({"response_text": quick.get("encouragement", ""), "source": "cache"})
     except Exception:
         return Response({"response_text": "", "source": "n/a"})
 

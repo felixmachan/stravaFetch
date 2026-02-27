@@ -216,6 +216,8 @@ export function PlanPage() {
     if (goal.notes) cards.push({ label: 'Notes', value: goal.notes });
     return cards;
   }, [goal]);
+  const primaryGoalCards = useMemo(() => goalSummaryCards.filter((c) => c.label !== 'Notes'), [goalSummaryCards]);
+  const goalNotesCard = useMemo(() => goalSummaryCards.find((c) => c.label === 'Notes'), [goalSummaryCards]);
 
   const upcoming = useMemo(() => {
     const today = new Date().toISOString().slice(0, 10);
@@ -226,10 +228,10 @@ export function PlanPage() {
 
   return (
     <div className='space-y-4'>
-      <Card className='p-6'>
+      <Card className='border-cyan-400/25 bg-gradient-to-r from-red-500/10 via-slate-900/80 to-cyan-500/10 p-6 shadow-[0_0_0_1px_rgba(34,211,238,0.08),0_18px_50px_-30px_rgba(6,182,212,0.65)]'>
         <div className='flex items-center justify-between'>
           <div>
-            <p className='text-2xl font-semibold'>Goal Definition</p>
+            <p className='flex items-center gap-2 text-2xl font-semibold'><Target className='h-5 w-5 text-cyan-300' />Goal Definition</p>
             <p className='mt-1 text-sm text-muted-foreground'>Goal data is read-only by default. Use edit when needed.</p>
           </div>
           <Button variant={editingGoal ? 'outline' : 'default'} onClick={() => setEditingGoal((v) => !v)}>
@@ -238,17 +240,27 @@ export function PlanPage() {
         </div>
 
         {!editingGoal ? (
-          <div className='mt-4 grid gap-3 md:grid-cols-2 lg:grid-cols-3'>
-            {goalSummaryCards.map((card) => (
+          <>
+            <div className='mt-4 flex items-stretch gap-3 overflow-x-auto pb-1'>
+              {primaryGoalCards.map((card) => (
+                <div
+                  key={card.label}
+                  className='min-w-[220px] rounded-xl border border-cyan-400/25 bg-slate-950/45 px-4 py-3 backdrop-blur-sm'
+                >
+                  <p className='text-xs uppercase tracking-wide text-cyan-100/70'>{card.label}</p>
+                  <p className='text-2xl font-semibold text-slate-100'>{card.value}</p>
+                </div>
+              ))}
+            </div>
+            {goalNotesCard ? (
               <div
-                key={card.label}
-                className={`rounded-xl border border-border p-3 ${card.label === 'Notes' ? 'md:col-span-2 lg:col-span-3' : ''}`}
+                className='mt-3 rounded-xl border border-cyan-300/20 bg-slate-950/35 p-3'
               >
-                <p className='text-xs text-muted-foreground'>{card.label}</p>
-                <p className={`${card.label === 'Notes' ? 'text-sm' : 'text-lg'} font-semibold text-slate-200`}>{card.value}</p>
+                <p className='text-xs uppercase tracking-wide text-cyan-100/70'>Notes</p>
+                <p className='text-sm text-slate-200'>{goalNotesCard.value}</p>
               </div>
-            ))}
-          </div>
+            ) : null}
+          </>
         ) : (
           <div className='mt-4 space-y-4'>
             <div className='grid gap-4 md:grid-cols-2'>

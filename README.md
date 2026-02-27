@@ -54,3 +54,27 @@ Required Strava env vars:
 
 Frontend base URL:
 - `VITE_API_BASE_URL` (default `http://localhost:8000/api`)
+
+## AI Pipeline (token-efficient)
+- Model routing:
+  - `gpt-5-mini`: weekly plan generation, general chat.
+  - `gpt-5-nano`: per-workout coach note, weekly summary, dashboard quick encouragement.
+  - Rare escalation to `gpt-5.2` only on low-confidence + severe risk flags (`injury`, `overtraining`, `sudden_load_spike`).
+- Context control:
+  - User-level `lookback_days` is enforced for workout selection.
+  - `athlete_state` is compact and cached by `(user_id, lookback_days, last_workout_id)`.
+  - Plan/chat only receive compact profile + goal + athlete_state + retrieved relevant workouts (not raw workout dumps).
+- Structured outputs:
+  - Non-chat features use JSON schema with validation + one repair retry.
+- Cache keys:
+  - Weekly summary: `(user_id, week_start, last_workout_id)`.
+  - Quick encouragement: `(user_id, week_start, last_workout_id)`.
+  - Weekly plan: `(user_id, week_start, input_hash)`.
+- Logging:
+  - Every AI call stores model and token usage in `AIInteraction`.
+
+### Sunday plan regen locally
+1. Ensure backend timezone is `Europe/Budapest` (default in settings).
+2. Run Celery beat/worker as usual.
+3. Trigger manually from Django shell if needed:
+   - `from core.tasks import generate_weekly_plan_sunday; generate_weekly_plan_sunday.delay()`

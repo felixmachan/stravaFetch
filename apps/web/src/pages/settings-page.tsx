@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Link2, MessageSquare, RefreshCcw, Settings2, Unplug } from '../components/ui/icons';
+import { AlertTriangle, Link2, MessageSquare, RefreshCcw, Settings2, Unplug } from '../components/ui/icons';
 import { api } from '../lib/api';
 import { Card } from '../components/ui/card';
 import { Input } from '../components/ui/input';
@@ -9,8 +9,9 @@ import { Button } from '../components/ui/button';
 import { useAuth } from '../context/auth-context';
 
 export function SettingsPage() {
+  const navigate = useNavigate();
   const qc = useQueryClient();
-  const { stravaConnected, refreshMe } = useAuth();
+  const { stravaConnected, refreshMe, logout } = useAuth();
   const [searchParams] = useSearchParams();
   const { data } = useQuery({
     queryKey: ['ai-settings'],
@@ -18,6 +19,7 @@ export function SettingsPage() {
   });
   const [memoryDays, setMemoryDays] = useState(30);
   const [maxChars, setMaxChars] = useState(160);
+  const [deleteConfirm, setDeleteConfirm] = useState('');
   const [manualCode, setManualCode] = useState('');
   const { data: telegramSetup } = useQuery({
     queryKey: ['telegram-setup'],
@@ -181,6 +183,24 @@ export function SettingsPage() {
       window.dispatchEvent(new CustomEvent('app:toast', { detail: { title: 'Settings saved', message: 'AI memory settings updated.' } }));
     },
   });
+  const deleteAccount = useMutation({
+    mutationFn: async () => (await api.delete('/auth/delete-account')).data,
+    onSuccess: async () => {
+      await logout();
+      window.dispatchEvent(new CustomEvent('app:toast', { detail: { title: 'Account deleted', message: 'Your account and related data were removed.' } }));
+      navigate('/login', { replace: true });
+    },
+    onError: (err: any) => {
+      window.dispatchEvent(
+        new CustomEvent('app:toast', {
+          detail: {
+            title: 'Delete failed',
+            message: err?.response?.data?.detail || 'Could not delete account.',
+          },
+        })
+      );
+    },
+  });
 
   return (
     <div className='space-y-4'>
@@ -302,6 +322,27 @@ export function SettingsPage() {
         </div>
         <div className='mt-4'>
           <Button onClick={() => save.mutate()} disabled={save.isPending}>{save.isPending ? 'Saving...' : 'Save settings'}</Button>
+        </div>
+      </Card>
+
+      <Card className='border-rose-500/40 bg-rose-500/5 p-6'>
+        <p className='flex items-center gap-2 text-2xl font-semibold text-rose-200'><AlertTriangle className='h-5 w-5 text-rose-300' />Danger Zone</p>
+        <p className='mt-1 text-sm text-rose-100/80'>
+          Delete your account and all related data (activities, plans, notes, integrations). This action cannot be undone.
+        </p>
+        <div className='mt-4 grid gap-3 md:grid-cols-[1fr_auto]'>
+          <Input
+            value={deleteConfirm}
+            onChange={(e) => setDeleteConfirm(e.target.value)}
+            placeholder='Type DELETE to confirm'
+          />
+          <Button
+            variant='danger'
+            onClick={() => deleteAccount.mutate()}
+            disabled={deleteAccount.isPending || deleteConfirm !== 'DELETE'}
+          >
+            {deleteAccount.isPending ? 'Deleting account...' : 'Delete account'}
+          </Button>
         </div>
       </Card>
     </div>

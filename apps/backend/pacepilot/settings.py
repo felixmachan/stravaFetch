@@ -94,6 +94,7 @@ CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', REDIS_URL if IS_PRODUCTION el
 CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/1' if IS_PRODUCTION else 'cache+memory://')
 CELERY_TASK_ALWAYS_EAGER = os.getenv('CELERY_TASK_ALWAYS_EAGER', '0' if IS_PRODUCTION else '1') == '1'
 CELERY_TASK_EAGER_PROPAGATES = True
+CELERY_TIMEZONE = TIME_ZONE
 CELERY_BEAT_SCHEDULE = {
     'poll-strava': {
         'task': 'core.tasks.poll_strava_activities',
@@ -101,7 +102,7 @@ CELERY_BEAT_SCHEDULE = {
     },
     'weekly-plan-sunday': {
         'task': 'core.tasks.generate_weekly_plan_sunday',
-        'schedule': crontab(minute=0, hour=18, day_of_week='sun'),
+        'schedule': crontab(minute=0, hour=2, day_of_week='sun'),
     },
 }
 
@@ -115,3 +116,4 @@ LOGGING = {
 
 if os.getenv('USE_SQLITE', '0') == '1':
     DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': BASE_DIR / 'db.sqlite3'}}
+
