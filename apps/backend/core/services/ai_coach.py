@@ -135,6 +135,14 @@ def _align_days_to_training_days(
     return aligned
 
 
+def _safe_iso_date(value: Any, fallback: dt.date) -> dt.date:
+    raw = str(value or "").strip()
+    try:
+        return dt.date.fromisoformat(raw)
+    except Exception:
+        return fallback
+
+
 def _normalize_model(ai_settings: dict[str, Any]) -> str:
     allowed = {"gpt-4o-mini", "gpt-4.1-mini"}
     model = str(ai_settings.get("ai_model") or os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
@@ -438,10 +446,14 @@ def refresh_week_plan_status(user: User, plan: TrainingPlan | None = None) -> Tr
     activities = Activity.objects.filter(user=user, is_deleted=False, start_date__date__gte=tp.start_date, start_date__date__lte=tp.end_date)
     today = timezone.localdate()
     changed = False
-    for item in days:
+    for idx, item in enumerate(days):
         if not isinstance(item, dict) or not item.get("date"):
             continue
-        planned_date = dt.date.fromisoformat(item["date"])
+        planned_date = _safe_iso_date(item.get("date"), tp.start_date + dt.timedelta(days=min(idx, 6)))
+        normalized_iso = planned_date.isoformat()
+        if item.get("date") != normalized_iso:
+            item["date"] = normalized_iso
+            changed = True
         planned_sport = str(item.get("sport") or "").lower()
         done = False
         for a in activities:
@@ -505,12 +517,13 @@ def generate_weekly_plan(user: User, force: bool = False) -> dict[str, Any]:
     except Exception:
         parsed_week_start = next_week_start
     normalized_days = []
-    for item in parsed.get("days", []):
+    for idx, item in enumerate(parsed.get("days", [])):
         if not isinstance(item, dict):
             continue
+        safe_date = _safe_iso_date(item.get("date"), parsed_week_start + dt.timedelta(days=min(idx, 6))).isoformat()
         normalized_days.append(
             {
-                "date": item.get("date"),
+                "date": safe_date,
                 "sport": item.get("sport") or "run",
                 "duration_min": item.get("duration_min"),
                 "distance_km": item.get("distance_km"),
