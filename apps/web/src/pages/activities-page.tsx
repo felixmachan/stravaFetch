@@ -34,16 +34,18 @@ export function ActivitiesPage() {
   return (
     <div className='space-y-4'>
       <Card className='p-5'>
-        <div className='grid gap-3 md:grid-cols-[1fr_auto_auto_auto]'>
-          <div className='relative'>
+        <div className='grid gap-3 md:grid-cols-[minmax(260px,420px)_1fr] md:items-center'>
+          <div className='relative md:max-w-[420px]'>
             <Search className='absolute left-3 top-3 h-5 w-5 text-muted-foreground' />
             <Input className='pl-10 text-base' placeholder='Search activity name' value={query} onChange={(e) => setQuery(e.target.value)} />
           </div>
-          {['all', 'run', 'ride', 'swim'].map((t) => (
-            <button key={t} type='button' onClick={() => setType(t)} className={`rounded-xl border px-4 py-2 text-base ${type === t ? 'border-primary bg-primary/10' : 'border-border bg-background'}`}>
-              {t.toUpperCase()}
-            </button>
-          ))}
+          <div className='flex flex-wrap items-center gap-2 md:justify-end'>
+            {['all', 'run', 'ride', 'swim'].map((t) => (
+              <button key={t} type='button' onClick={() => setType(t)} className={`rounded-xl border px-4 py-2 text-base ${type === t ? 'border-primary bg-primary/10' : 'border-border bg-background'}`}>
+                {t.toUpperCase()}
+              </button>
+            ))}
+          </div>
         </div>
       </Card>
 

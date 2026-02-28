@@ -27,6 +27,7 @@ from core.services.ai.context import (
     weekly_stats,
     workouts_in_lookback,
 )
+from core.services.personal_records import personal_records_snapshot
 from core.services.ai.prompts import SHARED_SYSTEM_POLICY
 
 
@@ -72,6 +73,7 @@ def build_context_snapshot(
         "lookback_days": settings["lookback_days"],
         "profile_json": profile_json(profile),
         "goal_json": goal_json(profile),
+        "personal_records_json": personal_records_snapshot(user),
         "athlete_state_json": athlete_state,
         "relevant_workouts_json": relevant_workouts(workouts),
         "weekly_stats": weekly_stats(user, settings["lookback_days"]),

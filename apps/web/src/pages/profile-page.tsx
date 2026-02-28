@@ -14,6 +14,18 @@ type ProfilePayload = {
   weight_kg?: number;
   weekly_target_hours?: number;
   hr_zones?: Array<{ index?: number; min?: number; max?: number }>;
+  personal_records?: Array<{
+    effort_key?: string;
+    effort_label?: string;
+    distance_m?: number | null;
+    records?: Array<{
+      rank?: number;
+      elapsed_time_s?: number;
+      achieved_at?: string | null;
+      activity_id?: number | null;
+      activity_name?: string;
+    }>;
+  }>;
   schedule?: Record<string, any>;
 };
 
@@ -107,6 +119,7 @@ export function ProfilePage() {
   const birthDate = form.schedule?.strava_birthdate || form.schedule?.birth_date || 'Not available';
   const bikes: GearItem[] = form.schedule?.strava_gear?.bikes || [];
   const shoes: GearItem[] = form.schedule?.strava_gear?.shoes || [];
+  const personalRecords = Array.isArray(form.personal_records) ? form.personal_records : [];
   const displayName = form.display_name || `${user?.username || 'Athlete'}`;
   const km = (m?: number) => `${((Number(m) || 0) / 1000).toFixed(1)} km`;
 
@@ -158,6 +171,30 @@ export function ProfilePage() {
             </div>
           </div>
         </div>
+      </Card>
+
+      <Card className='p-6'>
+        <p className='flex items-center gap-2 text-xl font-semibold'><Target className='h-5 w-5 text-cyan-300' />Personal Records</p>
+        <p className='mt-1 text-sm text-muted-foreground'>Top 3 efforts by distance bucket, updated on each Strava detail sync.</p>
+        {personalRecords.length ? (
+          <div className='mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3'>
+            {personalRecords.map((group, idx) => (
+              <div key={group.effort_key || idx} className='rounded-xl border border-border p-3'>
+                <p className='text-base font-semibold'>{group.effort_label || 'Effort'}</p>
+                <div className='mt-2 space-y-1 text-sm'>
+                  {(group.records || []).slice(0, 3).map((record, i) => (
+                    <div key={i} className='flex items-center justify-between gap-2 rounded-md bg-muted/20 px-2 py-1'>
+                      <span className='text-muted-foreground'>#{record.rank || i + 1}</span>
+                      <span className='font-semibold'>{Math.floor((Number(record.elapsed_time_s || 0)) / 60)}:{String(Number(record.elapsed_time_s || 0) % 60).padStart(2, '0')}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className='mt-4 rounded-xl border border-border p-3 text-sm text-muted-foreground'>No PR buckets yet. They will appear after detailed Strava syncs.</div>
+        )}
       </Card>
 
       <Card className='p-6'>

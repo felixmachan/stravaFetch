@@ -46,6 +46,7 @@ from .services.ai_coach import (
 )
 from .services.ai import answer_general_chat, generate_quick_encouragement, generate_weekly_summary
 from .services.strava import refresh_if_needed, sync_athlete_profile_from_connection, sync_athlete_profile_from_strava
+from .services.personal_records import personal_records_snapshot, podium_prs_from_best_efforts
 from .services.planned_workouts import (
     ensure_week_rows_from_training_plan,
     refresh_week_statuses,
@@ -1042,6 +1043,7 @@ def activity_detail(request, pk):
     data["hr_zone_ranges"] = ranges
     data["coach_note"] = CoachNote.objects.filter(activity=activity).order_by("-created_at").values().first()
     data["activity_reaction"] = CoachNote.objects.filter(activity=activity).order_by("-created_at").values().first()
+    data["new_prs"] = podium_prs_from_best_efforts((data.get("raw_payload") or {}).get("best_efforts") or [])
     return Response(data)
 
 
@@ -1069,8 +1071,14 @@ def profile(request):
         s.save()
         if hr_zones_updated:
             recalculated = _recompute_hr_metrics_for_user(request.user)
-            return Response({**ProfileSerializer(p).data, "recalculated_hr_metrics": recalculated})
-    return Response(ProfileSerializer(p).data)
+            return Response(
+                {
+                    **ProfileSerializer(p).data,
+                    "recalculated_hr_metrics": recalculated,
+                    "personal_records": personal_records_snapshot(request.user),
+                }
+            )
+    return Response({**ProfileSerializer(p).data, "personal_records": personal_records_snapshot(request.user)})
 
 
 @api_view(["GET", "PATCH"])

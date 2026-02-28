@@ -13,6 +13,7 @@ from .services.ai_coach import (
     generate_coach_tone as generate_coach_tone_service,
     generate_weekly_plan as generate_weekly_plan_service,
 )
+from .services.personal_records import update_personal_records_for_activity
 from .services.strava import refresh_if_needed, sync_athlete_profile_from_connection
 
 
@@ -413,6 +414,14 @@ def sync_streams_for_activity(user, activity, token):
             'average_cadence', 'average_watts', 'max_watts', 'weighted_average_watts', 'kilojoules',
             'kudos_count', 'comment_count', 'achievement_count', 'avg_hr', 'max_hr', 'calories', 'detail_synced_at'
         ])
+        try:
+            update_personal_records_for_activity(
+                user=user,
+                activity=activity,
+                best_efforts=detail.get('best_efforts') or [],
+            )
+        except Exception:
+            pass
 
     stream_url = f"https://www.strava.com/api/v3/activities/{activity.strava_activity_id}/streams"
     params = {
@@ -465,9 +474,20 @@ def sync_streams_for_activity(user, activity, token):
     activity.fully_synced = bool(detail_ok)
     activity.sync_error = "" if detail_ok else "detail_sync_failed"
     try:
-        has_highlighted_kudosers = bool((activity.raw_payload or {}).get("highlighted_kudosers"))
+        highlighted = (activity.raw_payload or {}).get("highlighted_kudosers") or []
+        has_highlighted_kudosers = bool(highlighted)
+        has_highlighted_avatars = any(
+            isinstance(k, dict) and (
+                k.get("avatar_url")
+                or k.get("profile")
+                or k.get("profile_medium")
+                or k.get("avatar")
+                or k.get("picture")
+            )
+            for k in highlighted
+        )
         # Small social preview for UI: who gave kudos.
-        if not has_highlighted_kudosers:
+        if (not has_highlighted_kudosers) or (not has_highlighted_avatars):
             kudos_resp = requests.get(
                 f"https://www.strava.com/api/v3/activities/{activity.strava_activity_id}/kudos",
                 headers={'Authorization': f'Bearer {token}'},
@@ -484,8 +504,9 @@ def sync_streams_for_activity(user, activity, token):
                             "id": athlete.get("id"),
                             "firstname": athlete.get("firstname") or "",
                             "lastname": athlete.get("lastname") or "",
-                            "profile": athlete.get("profile"),
-                            "profile_medium": athlete.get("profile_medium"),
+                            "avatar_url": athlete.get("avatar_url"),
+                            "profile": athlete.get("profile") or athlete.get("avatar"),
+                            "profile_medium": athlete.get("profile_medium") or athlete.get("picture"),
                         }
                     )
                 payload = activity.raw_payload or {}

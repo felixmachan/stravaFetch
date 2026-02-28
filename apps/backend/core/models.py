@@ -102,6 +102,26 @@ class DerivedMetrics(models.Model):
     hr_zone_distribution = models.JSONField(default=dict)
 
 
+class PersonalRecord(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    effort_key = models.CharField(max_length=96)
+    effort_label = models.CharField(max_length=128)
+    distance_m = models.FloatField(null=True, blank=True)
+    rank = models.PositiveSmallIntegerField(default=1)
+    elapsed_time_s = models.PositiveIntegerField()
+    achieved_at = models.DateTimeField(null=True, blank=True)
+    source_activity = models.ForeignKey(Activity, null=True, blank=True, on_delete=models.SET_NULL)
+    source_strava_activity_id = models.BigIntegerField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "effort_key", "rank")
+        indexes = [
+            models.Index(fields=["user", "effort_key", "rank"]),
+            models.Index(fields=["user", "updated_at"]),
+        ]
+
+
 class CoachNote(models.Model):
     activity = models.ForeignKey(Activity, on_delete=models.CASCADE)
     model = models.CharField(max_length=64)

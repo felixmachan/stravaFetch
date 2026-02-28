@@ -1,4 +1,3 @@
-import { Waves } from '../components/ui/icons';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -8,6 +7,7 @@ import { LatLngBounds } from 'leaflet';
 import { api } from '../lib/api';
 import { formatDuration, formatPace, km, pacePerKm } from '../lib/analytics';
 import { decodePolyline } from '../lib/polyline';
+import { Bike, PersonStanding, Waves } from '../components/ui/icons';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Card } from '../components/ui/card';
@@ -61,14 +61,14 @@ function formatPaceTick(secPerKm = 0) {
   return `${m}:${String(r).padStart(2, '0')}`;
 }
 
-function MetricTooltip({ active, payload }: any) {
+function MetricTooltip({ active, payload, showHr = true, showAlt = true }: any) {
   if (!active || !payload?.length) return null;
   const point = payload[0].payload || {};
   return (
     <div className='rounded-xl border border-slate-600/50 bg-slate-950/95 px-3 py-2 text-xs text-slate-100 shadow-xl'>
       <p className='font-semibold text-slate-200'>{formatClock(point.t || 0)}</p>
-      {point.hr != null && <p className='mt-1'>❤️ {Math.round(point.hr)} bpm</p>}
-      {point.alt != null && <p>⛰ {Math.round(point.alt)} m</p>}
+      {showHr && point.hr != null && <p className='mt-1'>{'\u{1F493}'} <span className='font-semibold'>{Math.round(point.hr)} bpm</span></p>}
+      {showAlt && point.alt != null && <p className='mt-1'>{'\u26F0\uFE0F'} <span className='font-semibold'>{Math.round(point.alt)} m</span></p>}
     </div>
   );
 }
@@ -104,21 +104,47 @@ function PowerTooltip({ active, payload }: any) {
   return (
     <div className='rounded-xl border border-slate-600/50 bg-slate-950/95 px-3 py-2 text-xs text-slate-100 shadow-xl'>
       <p className='font-semibold text-slate-200'>{formatClock(Number(point.t || 0))}</p>
-      <p className='mt-1'>Power: <span className='font-semibold'>{Math.round(Number(point.watts || 0))} W</span></p>
+      <p className='mt-1'>{'\u26A1'} <span className='font-semibold'>{Math.round(Number(point.watts || 0))} W</span></p>
     </div>
   );
 }
 
-function HrPaceTooltip({ active, payload }: any) {
+function HrPaceTooltip({ active, payload, mode }: { active?: boolean; payload?: any[]; mode: 'pace' | 'hr' | 'combined' }) {
   if (!active || !payload?.length) return null;
   const point = payload[0]?.payload || {};
+  const showHr = mode === 'hr' || mode === 'combined';
+  const showPace = mode === 'pace' || mode === 'combined';
   return (
     <div className='rounded-xl border border-slate-600/50 bg-slate-950/95 px-3 py-2 text-xs text-slate-100 shadow-xl'>
       <p className='font-semibold text-slate-200'>{formatClock(Number(point.t || 0))}</p>
-      {point.hr != null ? <p className='mt-1'>HR: <span className='font-semibold'>{Math.round(Number(point.hr))} bpm</span></p> : null}
-      {point.pace != null ? <p className='mt-1'>Pace: <span className='font-semibold'>{formatPace(Number(point.pace || 0))}</span></p> : null}
+      {showHr && point.hr != null ? <p className='mt-1'>{'\u{1F493}'} <span className='font-semibold'>{Math.round(Number(point.hr))} bpm</span></p> : null}
+      {showPace && point.pace != null ? <p className='mt-1'>{'\u{1F3C3}'} <span className='font-semibold'>{formatPace(Number(point.pace || 0))}</span></p> : null}
     </div>
   );
+}
+
+function medalClass(rank: number) {
+  if (rank === 1) return 'border-amber-200/80 bg-amber-300 text-amber-950';
+  if (rank === 2) return 'border-slate-200/70 bg-slate-300 text-slate-900';
+  return 'border-amber-200/70 bg-amber-700 text-amber-50';
+}
+
+function medalTooltipBorderClass(rank: number) {
+  if (rank === 1) return 'border-amber-300/80';
+  if (rank === 2) return 'border-slate-300/80';
+  return 'border-amber-500/80';
+}
+
+function kudosAvatarUrl(k: any): string {
+  return String(k?.avatar_url || k?.profile_medium || k?.profile || k?.avatar || k?.picture || '').trim();
+}
+
+function SportIcon({ type }: { type: string }) {
+  const lower = (type || '').toLowerCase();
+  if (lower.includes('run')) return <PersonStanding className='h-8 w-8 text-red-400' />;
+  if (lower.includes('ride') || lower.includes('bike')) return <Bike className='h-8 w-8 text-sky-400' />;
+  if (lower.includes('swim')) return <Waves className='h-8 w-8 text-cyan-300' />;
+  return <PersonStanding className='h-8 w-8 text-zinc-400' />;
 }
 
 export function ActivityDetailPage() {
@@ -296,10 +322,41 @@ export function ActivityDetailPage() {
   const hasPowerData = powerSeries.some((x) => Number.isFinite(x.watts) && x.watts > 0);
   const bestEfforts = Array.isArray(data?.raw_payload?.best_efforts) ? data.raw_payload.best_efforts : [];
   const achievementCount = Number((data?.achievement_count ?? data?.raw_payload?.achievement_count) || 0);
+  const newPrs = Array.isArray(data?.new_prs)
+    ? data.new_prs
+    : bestEfforts
+        .filter((effort: any) => [1, 2, 3].includes(Number(effort?.pr_rank || 0)))
+        .sort((a: any, b: any) => Number(a?.pr_rank || 0) - Number(b?.pr_rank || 0))
+        .map((effort: any) => ({
+          rank: Number(effort?.pr_rank || 0),
+          effort_label: String(effort?.name || 'Effort'),
+          elapsed_time_s: Number(effort?.elapsed_time || 0),
+        }));
+  const prMedals = useMemo(
+    () => (newPrs || []).filter((item: any) => [1, 2, 3].includes(Number(item?.rank || 0))),
+    [newPrs]
+  );
   const kudosCount = Number((data?.kudos_count ?? data?.raw_payload?.kudos_count) || 0);
   const highlightedKudosers = Array.isArray(data?.raw_payload?.highlighted_kudosers) ? data.raw_payload.highlighted_kudosers : [];
   const fallbackKudosPreview = Array.isArray(data?.raw_payload?.kudos_preview) ? data.raw_payload.kudos_preview : [];
-  const kudosPreview = highlightedKudosers.length ? highlightedKudosers : fallbackKudosPreview;
+  const kudosPreview = useMemo(() => {
+    const source = [...highlightedKudosers, ...fallbackKudosPreview];
+    const byKey = new Map<string, any>();
+    for (const item of source) {
+      const label = String(item?.display_name || `${item?.firstname || ''} ${item?.lastname || ''}`.trim() || '').trim();
+      const key = String(item?.id || label || '').trim();
+      if (!key) continue;
+      const prev = byKey.get(key);
+      if (!prev) {
+        byKey.set(key, item);
+        continue;
+      }
+      const prevHasImg = Boolean(kudosAvatarUrl(prev));
+      const nextHasImg = Boolean(kudosAvatarUrl(item));
+      if (!prevHasImg && nextHasImg) byKey.set(key, item);
+    }
+    return Array.from(byKey.values()).slice(0, 8);
+  }, [highlightedKudosers, fallbackKudosPreview]);
   useEffect(() => {
     if (data?.activity_reaction?.text_summary) {
       setQuickAi(data.activity_reaction.text_summary);
@@ -314,14 +371,16 @@ export function ActivityDetailPage() {
     <div className='space-y-5'>
       <Card className='p-6'>
         <div className='flex flex-wrap items-center justify-between gap-2'>
-          <div>
-            <p className='text-3xl font-semibold'>{data.name}</p>
-            <p className='text-base text-muted-foreground'>{new Date(data.start_date).toLocaleString()}</p>
+          <div className='flex items-center gap-3'>
+            <div className='grid h-12 w-12 place-items-center rounded-xl border border-border bg-background/60'>
+              <SportIcon type={data.type} />
+            </div>
+            <div>
+              <p className='text-3xl font-semibold'>{data.name}</p>
+              <p className='text-base text-muted-foreground'>{new Date(data.start_date).toLocaleString()}</p>
+            </div>
           </div>
-          <div className='flex items-center gap-2'>
-            <Badge className='text-sm'>{data.type}</Badge>
-            <Button variant='outline' onClick={() => navigate('/activities')}>Back</Button>
-          </div>
+          <Button variant='outline' onClick={() => navigate('/activities')}>Back</Button>
         </div>
         <div className='mt-6 grid grid-cols-2 gap-4 md:grid-cols-4'>
           <div><p className='text-sm text-muted-foreground'>Distance</p><p className='text-3xl font-semibold'>{km(data.distance_m).toFixed(2)} km</p></div>
@@ -330,29 +389,52 @@ export function ActivityDetailPage() {
           <div><p className='text-sm text-muted-foreground'>Avg HR</p><p className='text-3xl font-semibold'>{data.avg_hr ? Math.round(data.avg_hr) : 'n/a'}</p></div>
           <div><p className='text-sm text-muted-foreground'>Avg Power</p><p className='text-3xl font-semibold'>{avgWatts ? `${Math.round(avgWatts)} W` : 'n/a'}</p></div>
           <div><p className='text-sm text-muted-foreground'>Max Power</p><p className='text-3xl font-semibold'>{maxWatts ? `${Math.round(maxWatts)} W` : 'n/a'}</p></div>
-          <div><p className='text-sm text-muted-foreground'>Achievements</p><p className='text-3xl font-semibold'>{achievementCount}</p></div>
+          <div><p className='text-sm text-muted-foreground'>Achievements (Strava)</p><p className='text-3xl font-semibold'>{achievementCount}</p></div>
         </div>
-        <div className='mt-5 flex flex-wrap items-center gap-3 text-sm text-muted-foreground'>
-          <span className='font-medium'>Kudos: {kudosCount}</span>
-          {kudosPreview.slice(0, 6).map((k: any, idx: number) => {
-            const img = k?.avatar_url || k?.profile_medium || k?.profile || '';
-            const label =
-              k?.display_name
-              || `${k?.firstname || ''} ${k?.lastname || ''}`.trim()
-              || `Athlete ${idx + 1}`;
-            return (
-              <div key={`${k?.id || idx}`} className='flex items-center gap-1 rounded-full border border-border px-2 py-1'>
-                {img ? (
-                  <img src={img} alt={label} className='h-5 w-5 rounded-full object-cover' />
-                ) : (
-                  <div className='grid h-5 w-5 place-items-center rounded-full bg-muted text-[10px] text-foreground'>
-                    {label.slice(0, 1).toUpperCase()}
+        <div className='mt-5 flex items-center justify-between gap-4 text-sm text-muted-foreground'>
+          <div className='flex min-w-0 flex-wrap items-center gap-3'>
+            <span className='font-medium'>Kudos: {kudosCount}</span>
+            {kudosPreview.slice(0, 6).map((k: any, idx: number) => {
+              const img = kudosAvatarUrl(k);
+              const label =
+                k?.display_name
+                || `${k?.firstname || ''} ${k?.lastname || ''}`.trim()
+                || `Athlete ${idx + 1}`;
+              return (
+                <div key={`${k?.id || idx}`} className='flex items-center gap-1 rounded-full border border-border px-2 py-1'>
+                  {img ? (
+                    <img src={img} alt={label} className='h-5 w-5 rounded-full object-cover' />
+                  ) : (
+                    <div className='grid h-5 w-5 place-items-center rounded-full bg-muted text-[10px] text-foreground'>
+                      {label.slice(0, 1).toUpperCase()}
+                    </div>
+                  )}
+                  <span className='text-xs'>{label}</span>
+                </div>
+              );
+            })}
+          </div>
+          {prMedals.length > 0 ? (
+            <div className='flex shrink-0 items-center gap-2'>
+              {prMedals.map((pr: any, idx: number) => (
+                <div key={`${pr?.rank || 0}-${idx}`} className='group relative'>
+                  <div className='relative h-9 w-8'>
+                    <span className={`absolute left-1 top-0 h-2 w-2 rounded-sm border ${medalClass(Number(pr?.rank || 3))}`} />
+                    <span className={`absolute right-1 top-0 h-2 w-2 rounded-sm border ${medalClass(Number(pr?.rank || 3))}`} />
+                    <span className={`absolute bottom-0 left-0 grid h-7 w-8 place-items-center rounded-full border text-[10px] font-bold shadow-md ${medalClass(Number(pr?.rank || 3))}`}>
+                      {Number(pr?.rank || 0) === 1 ? 'PR' : `${Number(pr?.rank || 0)}`}
+                    </span>
                   </div>
-                )}
-                <span className='text-xs'>{label}</span>
-              </div>
-            );
-          })}
+                  <div className={`pointer-events-none absolute -top-2 right-0 z-30 w-60 -translate-y-full rounded-lg border bg-slate-950/95 px-3 py-2 text-xs text-slate-100 opacity-0 shadow-2xl transition-opacity duration-150 group-hover:opacity-100 ${medalTooltipBorderClass(Number(pr?.rank || 3))}`}>
+                    <p>New Personal Record at {String(pr?.effort_label || 'Effort')}!</p>
+                    <p>Congratulations!</p>
+                    <p>Time: {formatDuration(Number(pr?.elapsed_time_s || 0))}</p>
+                    <span className={`absolute -bottom-1 right-4 h-2 w-2 rotate-45 border-b border-r bg-slate-950/95 ${medalTooltipBorderClass(Number(pr?.rank || 3))}`} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
         </div>
         {!data?.fully_synced && (
           <p className='mt-4 text-sm text-amber-300'>
@@ -426,7 +508,7 @@ export function ActivityDetailPage() {
                     <CartesianGrid strokeDasharray='4 4' stroke='hsl(var(--border))' />
                     <XAxis dataKey='t' tickFormatter={(v) => formatClock(Number(v))} minTickGap={28} />
                     <YAxis />
-                    <ChartTooltip content={<MetricTooltip />} />
+                    <ChartTooltip content={<MetricTooltip showHr showAlt={false} />} />
                     <Area type='monotone' dataKey='hr' stroke='#fb7185' fill='url(#hrGradient)' strokeWidth={2.2} />
                   </AreaChart>
                 </ResponsiveContainer>
@@ -491,7 +573,7 @@ export function ActivityDetailPage() {
                       <CartesianGrid strokeDasharray='4 4' stroke='hsl(var(--border))' />
                       <XAxis dataKey='t' tickFormatter={(v) => formatClock(Number(v))} minTickGap={28} />
                       <YAxis />
-                      <ChartTooltip content={<MetricTooltip />} />
+                      <ChartTooltip content={<MetricTooltip showHr={false} showAlt />} />
                       <Area type='monotone' dataKey='alt' stroke='#38bdf8' dot={false} strokeWidth={2.4} fill='url(#altGradient)' />
                     </AreaChart>
                   </ResponsiveContainer>
@@ -535,7 +617,7 @@ export function ActivityDetailPage() {
                     {(hrPaceMode === 'pace' || hrPaceMode === 'combined') && (
                       <YAxis yAxisId='pace' orientation='right' domain={hrPaceDomain} tickFormatter={(v) => formatPaceTick(paceTickFromPlot(Number(v)))} />
                     )}
-                    <ChartTooltip content={<HrPaceTooltip />} />
+                    <ChartTooltip content={<HrPaceTooltip mode={hrPaceMode} />} />
                     {(hrPaceMode === 'hr' || hrPaceMode === 'combined') && (
                       <Area yAxisId='hr' type='monotone' dataKey='hr' stroke='#fb7185' dot={false} strokeWidth={2.1} fill='url(#hrCombinedGradient)' connectNulls />
                     )}
@@ -555,8 +637,8 @@ export function ActivityDetailPage() {
       <div className='grid gap-4 md:grid-cols-2'>
         <Card className='p-4'>
           <div className='flex items-center justify-between'>
-            <p className='text-base font-semibold'>Achievements</p>
-            <Badge>{achievementCount}</Badge>
+            <p className='text-base font-semibold'>Best Efforts</p>
+            <Badge>{bestEfforts.length}</Badge>
           </div>
           {bestEfforts.length ? (
             <div className='mt-3 max-h-64 overflow-y-auto'>
@@ -622,3 +704,4 @@ export function ActivityDetailPage() {
     </div>
   );
 }
+
