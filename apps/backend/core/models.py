@@ -218,6 +218,34 @@ class AIInteraction(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
+class AIChatSession(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    title = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["user", "-updated_at"]),
+        ]
+
+
+class AIChatMessage(models.Model):
+    session = models.ForeignKey(AIChatSession, on_delete=models.CASCADE, related_name="messages")
+    role = models.CharField(max_length=16)  # user | assistant
+    content = models.TextField(blank=True)
+    source = models.CharField(max_length=32, blank=True)
+    model = models.CharField(max_length=64, blank=True)
+    interaction = models.ForeignKey(AIInteraction, null=True, blank=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["session", "created_at"]),
+            models.Index(fields=["role"]),
+        ]
+
+
 class AIFeatureCache(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     feature = models.CharField(max_length=64)

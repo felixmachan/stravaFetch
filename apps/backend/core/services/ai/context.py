@@ -20,7 +20,7 @@ def get_ai_settings(profile: AthleteProfile) -> dict[str, Any]:
     return {
         "lookback_days": max(1, int(ai.get("lookback_days") or ai.get("memory_days") or 15)),
         "memory_days": max(1, int(ai.get("memory_days") or 30)),
-        "max_reply_chars": max(40, int(ai.get("max_reply_chars") or 220)),
+        "max_reply_chars": max(40, min(int(ai.get("max_reply_chars") or 500), 500)),
         "weekly_plan_enabled": bool(ai.get("weekly_plan_enabled", True)),
         "feature_flags": {
             "weekly_plan": bool(features.get("weekly_plan", True)),
@@ -79,6 +79,13 @@ def _activity_compact(a: Activity) -> dict[str, Any]:
         "pace_sec_per_km": pace_sec_per_km,
         "suffer_score": a.suffer_score,
     }
+
+
+def compact_workouts(workouts: list[Activity], limit: int | None = None) -> list[dict[str, Any]]:
+    rows = [_activity_compact(w) for w in workouts]
+    if limit is None:
+        return rows
+    return rows[: max(1, int(limit))]
 
 
 def workouts_in_lookback(user: User, lookback_days: int) -> list[Activity]:

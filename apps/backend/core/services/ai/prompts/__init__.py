@@ -36,11 +36,15 @@ def general_chat_user_prompt(
     goal_json: dict,
     athlete_state_json: dict,
     relevant_workouts_json: list[dict],
+    recent_10_workouts_json: list[dict],
     training_plan_json: dict,
+    chat_history_json: list[dict] | None = None,
 ) -> str:
+    history = chat_history_json or []
     return (
         f"user_message={message} profile_json={profile_json} goal_json={goal_json} "
-        f"athlete_state_json={athlete_state_json} relevant_workouts_json={relevant_workouts_json} training_plan_json={training_plan_json}. "
+        f"athlete_state_json={athlete_state_json} relevant_workouts_json={relevant_workouts_json} recent_10_workouts_json={recent_10_workouts_json} training_plan_json={training_plan_json} "
+        f"chat_history_json={history}. "
         "Answer directly and practical. Ask at most one follow-up question only if required."
     )
 

@@ -12,6 +12,7 @@ import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Card } from '../components/ui/card';
 import { AiCallout } from '../components/ui/ai-callout';
+import { Skeleton } from '../components/ui/skeleton';
 
 function FitRouteBounds({ points }: { points: [number, number][] }) {
   const map = useMap();
@@ -155,7 +156,7 @@ export function ActivityDetailPage() {
   const [quickAi, setQuickAi] = useState('');
   const [hrPaceMode, setHrPaceMode] = useState<'pace' | 'hr' | 'combined'>('combined');
 
-  const { data } = useQuery({ queryKey: ['activity', id], queryFn: async () => (await api.get(`/activities/${id}`)).data, enabled: Boolean(id) });
+  const { data, isLoading } = useQuery({ queryKey: ['activity', id], queryFn: async () => (await api.get(`/activities/${id}`)).data, enabled: Boolean(id) });
   const syncNow = useMutation({
     mutationFn: async () => (await api.post('/strava/sync-now')).data,
     onSuccess: () => {
@@ -178,7 +179,7 @@ export function ActivityDetailPage() {
   const routePoints = useMemo<[number, number][]>(() => {
     if (!data) return [];
     if (Array.isArray(data?.streams?.latlng) && data.streams.latlng.length > 1) return data.streams.latlng;
-    if (Array.isArray(data?.raw_payload?.map?.polyline_points) && data.raw_payload.map.polyline_points.length > 1) return data.raw_payload.map.polyline_points;
+    if (Array.isArray(data?.map_polyline_points) && data.map_polyline_points.length > 1) return data.map_polyline_points;
     if (data.map_summary_polyline) return decodePolyline(data.map_summary_polyline);
     return [];
   }, [data]);
@@ -204,12 +205,15 @@ export function ActivityDetailPage() {
     const distance = (data?.streams?.distance || []) as number[];
     const time = (data?.streams?.time || []) as number[];
     const hr = (data?.streams?.heartrate || []) as number[];
+    const velocity = (data?.streams?.velocity_smooth || []) as number[];
+    const moving = (data?.streams?.moving || []) as boolean[];
     const len = Math.min(distance.length, time.length);
     if (len < 2) return [] as Array<{ t: number; hr: number | null; pace: number | null; pace_plot: number | null }>;
-    const bucketSec = 10;
+    const bucketSec = 4;
     const fallbackPace = pacePerKm(Number(data?.distance_m || 0), Number(data?.moving_time_s || 0)) || 360;
     let lastHr = hr.find((x) => x != null) ?? (data?.avg_hr ?? null);
     let emaPace = fallbackPace;
+    const emaAlpha = 0.35; // lighter smoothing to preserve sharper pace peaks
     const out: Array<{ t: number; hr: number | null; pace: number | null }> = [];
     let startIdx = 0;
     for (let i = 1; i < len; i += 1) {
@@ -218,15 +222,20 @@ export function ActivityDetailPage() {
       const dt = elapsed;
       const dd = Number(distance[i] || 0) - Number(distance[startIdx] || 0);
       let paceCandidate: number | null = null;
-      if (dt > 0 && dd > 2) {
+      const vel = Number(velocity[i] || 0);
+      const isMoving = moving.length ? Boolean(moving[i]) : true;
+      if (isMoving && vel > 0) {
+        const fromVelocity = 1000 / vel;
+        if (Number.isFinite(fromVelocity) && fromVelocity >= 120 && fromVelocity <= 1200) {
+          paceCandidate = fromVelocity;
+        }
+      } else if (dt > 0 && dd > 2) {
         const p = dt / (dd / 1000);
         if (Number.isFinite(p) && p >= 120 && p <= 1200) {
-          const lower = emaPace * 0.55;
-          const upper = emaPace * 1.6;
-          paceCandidate = Math.max(lower, Math.min(upper, p));
+          paceCandidate = p;
         }
       }
-      if (paceCandidate != null) emaPace = (emaPace * 0.82) + (paceCandidate * 0.18);
+      if (paceCandidate != null) emaPace = (emaPace * (1 - emaAlpha)) + (paceCandidate * emaAlpha);
       let hrSum = 0;
       let hrCount = 0;
       for (let j = startIdx; j <= i; j += 1) {
@@ -237,7 +246,7 @@ export function ActivityDetailPage() {
       }
       const hrValue = hrCount > 0 ? (hrSum / hrCount) : (lastHr ?? null);
       if (hrValue != null) lastHr = hrValue;
-      out.push({ t: Number(time[i] || 0), hr: hrValue, pace: Number(emaPace.toFixed(1)) });
+      out.push({ t: Number(time[i] || 0), hr: hrValue, pace: paceCandidate != null ? Number(emaPace.toFixed(1)) : null });
       startIdx = i;
     }
     const paceValues = out.map((x) => Number(x.pace || 0)).filter((x) => Number.isFinite(x) && x > 0);
@@ -264,7 +273,7 @@ export function ActivityDetailPage() {
   const hasHrPaceCombinedData = hrPaceSeries.some((x) => x.hr != null || x.pace != null);
 
   const splits = useMemo(() => {
-    const rawSplits = data?.raw_payload?.splits_metric || [];
+    const rawSplits = data?.splits_metric || [];
     if (rawSplits.length) return rawSplits;
     const distances = data?.streams?.distance || [];
     const times = data?.streams?.time || [];
@@ -301,14 +310,14 @@ export function ActivityDetailPage() {
   const cadence = data?.streams?.cadence || [];
   const avgCadence = cadence.length
     ? cadence.reduce((s: number, c: number) => s + c, 0) / cadence.length
-    : (Number((data?.average_cadence ?? data?.raw_payload?.average_cadence) || 0) || null);
+    : (Number(data?.average_cadence || 0) || null);
   const watts = data?.streams?.watts || [];
   const avgWatts = watts.length
     ? watts.reduce((sum: number, w: number) => sum + Number(w || 0), 0) / Math.max(1, watts.length)
-    : (Number((data?.average_watts ?? data?.raw_payload?.average_watts) || 0) || null);
+    : (Number(data?.average_watts || 0) || null);
   const maxWatts = watts.length
     ? Math.max(...watts.map((w: number) => Number(w || 0)))
-    : (Number((data?.max_watts ?? data?.raw_payload?.max_watts) || 0) || null);
+    : (Number(data?.max_watts || 0) || null);
   const powerSeries = useMemo(() => {
     const power = (data?.streams?.watts || []) as number[];
     const time = (data?.streams?.time || []) as number[];
@@ -320,8 +329,8 @@ export function ActivityDetailPage() {
     }));
   }, [data]);
   const hasPowerData = powerSeries.some((x) => Number.isFinite(x.watts) && x.watts > 0);
-  const bestEfforts = Array.isArray(data?.raw_payload?.best_efforts) ? data.raw_payload.best_efforts : [];
-  const achievementCount = Number((data?.achievement_count ?? data?.raw_payload?.achievement_count) || 0);
+  const bestEfforts = Array.isArray(data?.best_efforts) ? data.best_efforts : [];
+  const achievementCount = Number(data?.achievement_count || 0);
   const newPrs = Array.isArray(data?.new_prs)
     ? data.new_prs
     : bestEfforts
@@ -336,9 +345,9 @@ export function ActivityDetailPage() {
     () => (newPrs || []).filter((item: any) => [1, 2, 3].includes(Number(item?.rank || 0))),
     [newPrs]
   );
-  const kudosCount = Number((data?.kudos_count ?? data?.raw_payload?.kudos_count) || 0);
-  const highlightedKudosers = Array.isArray(data?.raw_payload?.highlighted_kudosers) ? data.raw_payload.highlighted_kudosers : [];
-  const fallbackKudosPreview = Array.isArray(data?.raw_payload?.kudos_preview) ? data.raw_payload.kudos_preview : [];
+  const kudosCount = Number(data?.kudos_count || 0);
+  const highlightedKudosers = Array.isArray(data?.highlighted_kudosers) ? data.highlighted_kudosers : [];
+  const fallbackKudosPreview = Array.isArray(data?.kudos_preview) ? data.kudos_preview : [];
   const kudosPreview = useMemo(() => {
     const source = [...highlightedKudosers, ...fallbackKudosPreview];
     const byKey = new Map<string, any>();
@@ -365,6 +374,25 @@ export function ActivityDetailPage() {
     }
   }, [data?.activity_reaction?.text_summary]);
 
+  if (isLoading) {
+    return (
+      <div className='space-y-5'>
+        <Card className='p-6'>
+          <Skeleton className='h-8 w-64' />
+          <Skeleton className='mt-2 h-5 w-48' />
+          <div className='mt-6 grid grid-cols-2 gap-4 md:grid-cols-4'>
+            {Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className='h-20' />)}
+          </div>
+        </Card>
+        <Skeleton className='h-28' />
+        <Skeleton className='h-72' />
+        <div className='grid gap-4 md:grid-cols-2'>
+          <Skeleton className='h-72' />
+          <Skeleton className='h-72' />
+        </div>
+      </div>
+    );
+  }
   if (!data) return null;
 
   return (
@@ -385,10 +413,17 @@ export function ActivityDetailPage() {
         <div className='mt-6 grid grid-cols-2 gap-4 md:grid-cols-4'>
           <div><p className='text-sm text-muted-foreground'>Distance</p><p className='text-3xl font-semibold'>{km(data.distance_m).toFixed(2)} km</p></div>
           <div><p className='text-sm text-muted-foreground'>Time</p><p className='text-3xl font-semibold'>{formatDuration(data.moving_time_s)}</p></div>
-          <div><p className='text-sm text-muted-foreground'>Avg pace</p><p className='text-3xl font-semibold'>{formatPace(pacePerKm(data.distance_m, data.moving_time_s))}</p></div>
+          <div>
+            <p className='text-sm text-muted-foreground'>{isSwim ? 'Average 100m' : 'Avg pace'}</p>
+            <p className='text-3xl font-semibold'>
+              {isSwim
+                ? `${formatDuration(avg100m)} /100m`
+                : formatPace(pacePerKm(data.distance_m, data.moving_time_s))}
+            </p>
+          </div>
           <div><p className='text-sm text-muted-foreground'>Avg HR</p><p className='text-3xl font-semibold'>{data.avg_hr ? Math.round(data.avg_hr) : 'n/a'}</p></div>
-          <div><p className='text-sm text-muted-foreground'>Avg Power</p><p className='text-3xl font-semibold'>{avgWatts ? `${Math.round(avgWatts)} W` : 'n/a'}</p></div>
-          <div><p className='text-sm text-muted-foreground'>Max Power</p><p className='text-3xl font-semibold'>{maxWatts ? `${Math.round(maxWatts)} W` : 'n/a'}</p></div>
+          {!isSwim && <div><p className='text-sm text-muted-foreground'>Avg Power</p><p className='text-3xl font-semibold'>{avgWatts ? `${Math.round(avgWatts)} W` : 'n/a'}</p></div>}
+          {!isSwim && <div><p className='text-sm text-muted-foreground'>Max Power</p><p className='text-3xl font-semibold'>{maxWatts ? `${Math.round(maxWatts)} W` : 'n/a'}</p></div>}
           <div><p className='text-sm text-muted-foreground'>Achievements (Strava)</p><p className='text-3xl font-semibold'>{achievementCount}</p></div>
         </div>
         <div className='mt-5 flex items-center justify-between gap-4 text-sm text-muted-foreground'>
@@ -518,16 +553,25 @@ export function ActivityDetailPage() {
             </div>
           </Card>
           <Card className='h-72 p-4'>
-            <p className='text-base font-semibold'><Waves className='mr-1 inline h-4 w-4 text-cyan-300' />Swim Metrics</p>
-            <div className='mt-4 grid grid-cols-2 gap-4'>
-              <div className='rounded-xl border border-border p-3'>
-                <p className='text-xs text-muted-foreground'>Average 100m</p>
-                <p className='text-2xl font-semibold'>{formatClock(avg100m)} /100m</p>
-              </div>
-              <div className='rounded-xl border border-border p-3'>
-                <p className='text-xs text-muted-foreground'>Avg stroke cadence</p>
-                <p className='text-2xl font-semibold'>{avgCadence ? `${Math.round(avgCadence)} spm` : 'n/a'}</p>
-              </div>
+            <p className='mb-2 text-base font-semibold'>Heart Rate Zones</p>
+            <div className='h-[220px]'>
+              <ResponsiveContainer width='100%' height='100%'>
+                <BarChart data={zoneData} layout='vertical' margin={{ top: 6, right: 20, left: 8, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray='3 3' stroke='hsl(var(--border))' />
+                  <XAxis type='number' tickFormatter={(v) => formatDuration(Number(v))} />
+                  <YAxis dataKey='zone' type='category' width={36} />
+                  <ChartTooltip content={<ZoneTooltip />} cursor={false} />
+                  <Bar
+                    dataKey='seconds'
+                    radius={[0, 8, 8, 0]}
+                    activeBar={{ fillOpacity: 1, stroke: '#e2e8f0', strokeWidth: 1.5, style: { filter: 'drop-shadow(0 0 8px rgba(226,232,240,0.6))' } as any }}
+                  >
+                    {zoneData.map((z) => (
+                      <Cell key={z.zone} fill={z.fill} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
             </div>
           </Card>
         </div>
@@ -634,7 +678,8 @@ export function ActivityDetailPage() {
         </>
       )}
 
-      <div className='grid gap-4 md:grid-cols-2'>
+      <div className={`grid gap-4 ${isSwim ? '' : 'md:grid-cols-2'}`}>
+        {!isSwim && (
         <Card className='p-4'>
           <div className='flex items-center justify-between'>
             <p className='text-base font-semibold'>Best Efforts</p>
@@ -665,6 +710,7 @@ export function ActivityDetailPage() {
             <div className='mt-3 text-sm text-muted-foreground'>No best-effort data available for this activity.</div>
           )}
         </Card>
+        )}
         <Card className='p-4'>
           <div className='flex items-center justify-between'>
             <p className='text-base font-semibold'>Splits</p>
@@ -682,6 +728,7 @@ export function ActivityDetailPage() {
           </div>
         </Card>
 
+        {!isSwim && (
         <Card className='p-4'>
           <p className='mb-2 text-base font-semibold'>Heart Rate Zones</p>
           <div className='h-44'>
@@ -690,8 +737,12 @@ export function ActivityDetailPage() {
                 <CartesianGrid strokeDasharray='3 3' stroke='hsl(var(--border))' />
                 <XAxis type='number' tickFormatter={(v) => formatDuration(Number(v))} />
                 <YAxis dataKey='zone' type='category' width={36} />
-                <ChartTooltip content={<ZoneTooltip />} />
-                <Bar dataKey='seconds' radius={[0, 8, 8, 0]}>
+                <ChartTooltip content={<ZoneTooltip />} cursor={false} />
+                <Bar
+                  dataKey='seconds'
+                  radius={[0, 8, 8, 0]}
+                  activeBar={{ fillOpacity: 1, stroke: '#e2e8f0', strokeWidth: 1.5, style: { filter: 'drop-shadow(0 0 8px rgba(226,232,240,0.6))' } as any }}
+                >
                   {zoneData.map((z) => (
                     <Cell key={z.zone} fill={z.fill} />
                   ))}
@@ -700,6 +751,7 @@ export function ActivityDetailPage() {
             </ResponsiveContainer>
           </div>
         </Card>
+        )}
       </div>
     </div>
   );

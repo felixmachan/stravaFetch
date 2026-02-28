@@ -33,6 +33,8 @@ export type Activity = {
   fully_synced?: boolean;
   sync_error?: string;
   map_summary_polyline?: string | null;
+  highlighted_kudosers?: Array<Record<string, any>>;
+  kudos_preview?: Array<Record<string, any>>;
   raw_payload?: Record<string, any>;
 };
 

@@ -52,6 +52,24 @@ def _summary_defaults(user, a):
     }
 
 
+def _upsert_activity_summary(user, a):
+    defaults = _summary_defaults(user, a)
+    existing = Activity.objects.filter(strava_activity_id=a['id']).first()
+    if existing and isinstance(existing.raw_payload, dict):
+        # Preserve detailed fields already collected from activity detail endpoint.
+        merged_payload = dict(existing.raw_payload)
+        merged_payload.update(a)
+        defaults['raw_payload'] = merged_payload
+    return Activity.objects.update_or_create(
+        strava_activity_id=a['id'],
+        defaults=defaults,
+    )
+
+
+def _needs_detail_sync(activity):
+    return (not bool(activity.fully_synced)) or bool(activity.sync_error)
+
+
 @shared_task
 def poll_strava_activities():
     for conn in StravaConnection.objects.select_related('user').all():
@@ -148,7 +166,6 @@ def sync_now_for_user(user_id, import_from_date_iso=None):
     schedule = profile.schedule or {}
     onboarding = schedule.get("onboarding", {})
     onboarding["sync_in_progress"] = True
-    onboarding["full_sync_complete"] = False
     schedule["onboarding"] = onboarding
     profile.schedule = schedule
     profile.save(update_fields=["schedule"])
@@ -157,8 +174,6 @@ def sync_now_for_user(user_id, import_from_date_iso=None):
         sync_athlete_profile_from_connection(user, conn, force=False)
     except Exception:
         pass
-    # On onboarding, sync at most the latest 30 activities.
-
     fetched = 0
     upserted = 0
     new_activities = 0
@@ -171,12 +186,16 @@ def sync_now_for_user(user_id, import_from_date_iso=None):
     selected_activities = 0
     import_from_schedule = str((profile.schedule or {}).get("import_from_date") or "").strip()
     import_from_value = str(import_from_date_iso or import_from_schedule or "").strip()
+    initial_full_sync_done = bool(onboarding.get("initial_full_sync_done"))
+    initial_full_sync_required = not initial_full_sync_done
     if import_from_value:
         try:
             import_from_date = dt.date.fromisoformat(import_from_value)
             max_activities = None
         except Exception:
             import_from_date = None
+    if initial_full_sync_required:
+        max_activities = None
 
     def _activity_date(activity_payload):
         raw_start = str(activity_payload.get("start_date") or "").strip()
@@ -189,8 +208,8 @@ def sync_now_for_user(user_id, import_from_date_iso=None):
             return None
 
     try:
-        if import_from_date:
-            # Backfill mode for onboarding: walk pages until we pass the cutoff date.
+        if initial_full_sync_required or import_from_date:
+            # First onboarding sync: walk full history (or until cutoff) and fully enrich each unsynced activity.
             per_page = 100
             page = 1
             while True:
@@ -213,28 +232,26 @@ def sync_now_for_user(user_id, import_from_date_iso=None):
                 for a in batch:
                     parsed_activities += 1
                     activity_date = _activity_date(a)
-                    if activity_date and activity_date < import_from_date:
+                    if import_from_date and activity_date and activity_date < import_from_date:
                         stop_after_batch = True
                         continue
                     selected_activities += 1
-                    obj, created = Activity.objects.update_or_create(
-                        strava_activity_id=a['id'],
-                        defaults=_summary_defaults(user, a),
-                    )
+                    obj, created = _upsert_activity_summary(user, a)
                     synced_strava_ids.append(int(a['id']))
-                    try:
-                        sync_streams_for_activity(user, obj, token)
-                    except Exception:
-                        # Keep activity row even if stream sync fails.
-                        pass
-                    upserted += 1
                     if created:
                         new_activities += 1
+                    if _needs_detail_sync(obj):
+                        try:
+                            sync_streams_for_activity(user, obj, token)
+                        except Exception:
+                            # Keep activity row even if stream sync fails.
+                            pass
+                    upserted += 1
                 if stop_after_batch or len(batch) < per_page:
                     break
                 page += 1
         else:
-            # Regular polling mode: keep request light.
+            # Regular polling mode: pull recent summaries and enrich only new/unsynced activities.
             r = requests.get(
                 'https://www.strava.com/api/v3/athlete/activities',
                 headers={'Authorization': f'Bearer {token}'},
@@ -253,19 +270,17 @@ def sync_now_for_user(user_id, import_from_date_iso=None):
                 parsed_activities = len(items)
                 selected_activities = len(items)
                 for a in items:
-                    obj, created = Activity.objects.update_or_create(
-                        strava_activity_id=a['id'],
-                        defaults=_summary_defaults(user, a),
-                    )
+                    obj, created = _upsert_activity_summary(user, a)
                     synced_strava_ids.append(int(a['id']))
-                    try:
-                        sync_streams_for_activity(user, obj, token)
-                    except Exception:
-                        # Keep activity row even if stream sync fails.
-                        pass
-                    upserted += 1
                     if created:
                         new_activities += 1
+                    if _needs_detail_sync(obj):
+                        try:
+                            sync_streams_for_activity(user, obj, token)
+                        except Exception:
+                            # Keep activity row even if stream sync fails.
+                            pass
+                    upserted += 1
     except Exception as exc:
         sync_failed = True
         sync_error = str(exc)[:250]
@@ -282,16 +297,16 @@ def sync_now_for_user(user_id, import_from_date_iso=None):
     profile, _ = AthleteProfile.objects.get_or_create(user=user)
     schedule = profile.schedule or {}
     onboarding = schedule.get("onboarding", {})
-    recent_ids = list(
-        Activity.objects.filter(user=user, is_deleted=False)
-        .order_by("-start_date")
-        .values_list("id", flat=True)[:10]
-    )
+    base_qs = Activity.objects.filter(user=user, is_deleted=False)
+    recent_ids = list(base_qs.order_by("-start_date").values_list("id", flat=True)[:10])
     recent_total = len(recent_ids)
     recent_fully_synced = Activity.objects.filter(id__in=recent_ids, fully_synced=True).count() if recent_ids else 0
-    full_sync_complete = bool((not sync_failed) and (recent_total == 0 or recent_fully_synced == recent_total))
+    unsynced_total = base_qs.filter(fully_synced=False).count()
+    full_sync_complete = bool((not sync_failed) and unsynced_total == 0)
     onboarding["sync_in_progress"] = False
     onboarding["full_sync_complete"] = full_sync_complete
+    if full_sync_complete:
+        onboarding["initial_full_sync_done"] = True
     onboarding["last_full_sync_at"] = timezone.now().isoformat()
     onboarding["last_sync_result"] = {
         "fetched": fetched,
@@ -310,7 +325,6 @@ def sync_now_for_user(user_id, import_from_date_iso=None):
     profile.schedule = schedule
     profile.save(update_fields=["schedule"])
     if not sync_failed:
-        generate_coach_tone_task.delay(user.id)
         refresh_weekly_artifacts_task.delay(user.id)
     return {
         'rate_limited': sync_error == "strava_rate_limited",
@@ -369,6 +383,12 @@ def sync_streams_for_activity(user, activity, token):
     detail_url = f"https://www.strava.com/api/v3/activities/{activity.strava_activity_id}"
     detail_ok = False
     detail_resp = requests.get(detail_url, headers={'Authorization': f'Bearer {token}'}, params={'include_all_efforts': 'true'}, timeout=30)
+    if detail_resp.status_code == 429:
+        activity.fully_synced = False
+        activity.sync_error = "strava_rate_limited"
+        activity.streams_synced_at = timezone.now()
+        activity.save(update_fields=['fully_synced', 'sync_error', 'streams_synced_at'])
+        return
     if detail_resp.ok:
         detail_ok = True
         detail = detail_resp.json()
@@ -472,7 +492,7 @@ def sync_streams_for_activity(user, activity, token):
     )
     activity.streams_synced_at = timezone.now()
     activity.fully_synced = bool(detail_ok)
-    activity.sync_error = "" if detail_ok else "detail_sync_failed"
+    activity.sync_error = "" if detail_ok else f"detail_http_{detail_resp.status_code}"
     try:
         highlighted = (activity.raw_payload or {}).get("highlighted_kudosers") or []
         has_highlighted_kudosers = bool(highlighted)
@@ -551,3 +571,20 @@ def send_test_telegram_task(user_id):
     s = NotificationSettings.objects.get(user_id=user_id)
     if s.telegram_chat_id and os.getenv('TELEGRAM_BOT_TOKEN'):
         requests.post(f"https://api.telegram.org/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/sendMessage", json={'chat_id': s.telegram_chat_id, 'text': 'PacePilot test message'}, timeout=20)
+
+
+@shared_task
+def sync_activity_detail_task(activity_id, user_id):
+    user = User.objects.get(id=user_id)
+    activity = Activity.objects.get(id=activity_id, user=user)
+    conn = StravaConnection.objects.filter(user=user).first()
+    if not conn:
+        return {"ok": False, "reason": "strava_not_connected"}
+    try:
+        token = refresh_if_needed(conn)
+        sync_streams_for_activity(user, activity, token)
+        conn.last_polled_at = timezone.now()
+        conn.save(update_fields=['last_polled_at'])
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc)[:200]}

@@ -14,6 +14,7 @@ from .client import OpenAIResponsesClient
 from .context import (
     athlete_state_for_user,
     athlete_state_from_workouts,
+    compact_workouts,
     current_week_plan_json,
     get_ai_settings,
     get_or_set_cache,
@@ -44,6 +45,10 @@ from .schemas import (
     WeeklyPlanOutput,
     WeeklySummaryOutput,
 )
+
+GENERAL_CHAT_MAX_CHARS = 500
+WEEKLY_TEXT_MAX_CHARS = 200
+ACTIVITY_REACTION_MAX_CHARS = 150
 
 
 def _week_start(date: dt.date | None = None) -> dt.date:
@@ -113,6 +118,36 @@ def _normalize_sentences(text: str, *, min_sentences: int, max_sentences: int, f
     return ". ".join(chunks).strip() + "."
 
 
+def _cap_chars(text: str, max_chars: int) -> str:
+    value = str(text or "").strip()
+    if len(value) <= max_chars:
+        return value
+    window_start = max(0, max_chars - 120)
+    candidate = value[:max_chars]
+    for marker in ["\n\n", "\n", ". ", "! ", "? "]:
+        pos = candidate.rfind(marker, window_start)
+        if pos >= 0:
+            cutoff = pos + (2 if marker in {". ", "! ", "? "} else len(marker))
+            return candidate[:cutoff].rstrip()
+    space_pos = candidate.rfind(" ", window_start)
+    if space_pos > 0:
+        return candidate[:space_pos].rstrip()
+    return candidate.rstrip()
+
+
+def _looks_training_related(message: str) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    keywords = [
+        "run", "running", "pace", "hr", "heart rate", "zone", "workout", "training", "race", "marathon",
+        "recovery", "easy", "tempo", "interval", "long run", "strava", "swim", "ride", "bike",
+        "fut", "futas", "futás", "tempó", "tempo", "pulzus", "zóna", "edzés", "verseny", "félmaraton", "maraton",
+        "regen", "pihen", "km", "/km",
+    ]
+    return any(k in text for k in keywords)
+
+
 def _build_context(user: User, *, bootstrap_last_n: int | None = None) -> dict[str, Any]:
     profile, _ = AthleteProfile.objects.get_or_create(user=user)
     ai = get_ai_settings(profile)
@@ -131,6 +166,7 @@ def _build_context(user: User, *, bootstrap_last_n: int | None = None) -> dict[s
         "lookback_days": lookback,
         "workouts": workouts,
         "relevant_workouts_json": relevant_workouts(workouts),
+        "recent_10_workouts_json": compact_workouts(recent_workouts(user, 10), 10),
         "athlete_state_json": athlete_state,
         "athlete_state_cache_key": athlete_state_cache_key,
         "training_plan_json": current_week_plan_json(user),
@@ -282,7 +318,8 @@ def generate_weekly_plan(
     system_prompt = (
         SHARED_SYSTEM_POLICY
         + " Return strict JSON schema for weekly planning. Rules: max 2 hard sessions/week, avoid >10% weekly distance increase unless stable build is shown, "
-        "long run easy by default, respect availability/rest days, and reduce load when risk flags exist."
+        "long run easy by default, respect availability/rest days, and reduce load when risk flags exist. "
+        + "Include coach_brief: a short expectation summary in 1-3 sentences."
     )
     user_prompt = weekly_plan_user_prompt(
         ctx["profile_json"],
@@ -322,6 +359,7 @@ def generate_weekly_plan(
             )
         parsed = {
             "week_start_date": next_week.isoformat(),
+            "coach_brief": "Expect a controlled aerobic week focused on consistency. Keep hard stress low and protect recovery.",
             "plan": days,
             "weekly_targets": {
                 "total_distance_km": 28,
@@ -332,6 +370,12 @@ def generate_weekly_plan(
             "risk_notes": ["ai_fallback"],
         }
 
+    coach_brief = _normalize_sentences(
+        str(parsed.get("coach_brief") or "Expect a controlled week with consistent sessions and recovery focus."),
+        min_sentences=1,
+        max_sentences=3,
+        filler="Keep the week steady and recover well.",
+    )
     old_days = []
     for d in parsed.get("plan", []):
         old_days.append(
@@ -356,6 +400,7 @@ def generate_weekly_plan(
     plan_json = {
         "week_start": parsed.get("week_start_date", next_week.isoformat()),
         "week_end": (next_week + dt.timedelta(days=6)).isoformat(),
+        "coach_brief": coach_brief,
         "days": old_days,
         "weekly_targets": parsed.get("weekly_targets", {}),
         "risk_notes": parsed.get("risk_notes", []),
@@ -395,7 +440,8 @@ def generate_coach_says(user: User, activity: Activity) -> dict[str, Any]:
     }
     system_prompt = (
         SHARED_SYSTEM_POLICY
-        + " Return JSON with coach_says. Keep it 2-3 short sentences. No emojis. "
+        + f" Return JSON with coach_says. Hard limit: max {ACTIVITY_REACTION_MAX_CHARS} characters total. "
+        + "Keep it to 1-2 short sentences. No emojis. "
         + "If referencing planned sessions, use only training_plan_json and do not invent extra dates/sessions."
     )
     user_prompt = coach_says_user_prompt(workout_json, ctx["goal_json"], ctx["athlete_state_json"], ctx["training_plan_json"])
@@ -419,10 +465,11 @@ def generate_coach_says(user: User, activity: Activity) -> dict[str, Any]:
     text = (parsed or {}).get("coach_says") or "Nice work. Keep the next session easy and controlled."
     text = _normalize_sentences(
         text,
-        min_sentences=2,
-        max_sentences=3,
-        filler="If metrics are missing, use effort and breathing to stay controlled next workout",
+        min_sentences=1,
+        max_sentences=2,
+        filler="Keep your next session controlled and easy.",
     )
+    text = _cap_chars(text, ACTIVITY_REACTION_MAX_CHARS)
     CoachNote.objects.create(
         activity=activity,
         model=response.model,
@@ -469,6 +516,7 @@ def generate_weekly_summary(user: User) -> dict[str, Any]:
         system_prompt = (
             SHARED_SYSTEM_POLICY
             + " Return strict JSON weekly summary. headline max 8 words, highlights max 4 bullets. "
+            + f" Hard limit: each textual field must be <= {WEEKLY_TEXT_MAX_CHARS} characters. "
             + "training_plan_json is source of truth for planned sessions and dates; do not invent extra sessions or dates. "
             + "You must reason from goal_json and event timing, and explicitly align guidance to the stated goal trajectory."
         )
@@ -494,6 +542,7 @@ def generate_weekly_summary(user: User) -> dict[str, Any]:
             "next_week_focus": ["Consistency first."],
             "risk_flags": [],
         }
+        payload["headline"] = _cap_chars(payload.get("headline") or "", WEEKLY_TEXT_MAX_CHARS)
         payload["highlights"] = list(payload.get("highlights") or [])[:4]
         allowed_dates = {str(d.get("date")) for d in (ctx["training_plan_json"].get("days") or []) if isinstance(d, dict) and d.get("date")}
         for key in ["highlights", "what_to_improve", "next_week_focus", "risk_flags"]:
@@ -504,7 +553,7 @@ def generate_weekly_summary(user: User) -> dict[str, Any]:
                     continue
                 if allowed_dates and _mentions_unplanned_iso_date(txt, allowed_dates):
                     continue
-                rows.append(txt)
+                rows.append(_cap_chars(txt, WEEKLY_TEXT_MAX_CHARS))
             payload[key] = rows
 
         needs_addendum = bool(payload.get("risk_flags")) or "sudden_load_spike" in (ctx["athlete_state_json"].get("fatigue_risk_flags") or [])
@@ -519,7 +568,10 @@ def generate_weekly_summary(user: User) -> dict[str, Any]:
                 ),
                 temperature=0.1,
             )
-            payload["safe_adjustment_note"] = _cap_sentences(mini.text or "Reduce intensity and prioritize recovery next 48 hours.", 1)
+            payload["safe_adjustment_note"] = _cap_chars(
+                _cap_sentences(mini.text or "Reduce intensity and prioritize recovery next 48 hours.", 1),
+                WEEKLY_TEXT_MAX_CHARS,
+            )
 
         return payload, {"model": response.model, "tokens_input": response.tokens_input, "tokens_output": response.tokens_output}
 
@@ -546,7 +598,7 @@ def generate_quick_encouragement(user: User) -> dict[str, Any]:
     def _build():
         system_prompt = (
             SHARED_SYSTEM_POLICY
-            + " Return JSON with exactly two supportive but concrete sentences in encouragement field. "
+            + " Return JSON with 2-3 supportive but concrete sentences in encouragement field, never more than 3. "
             + "Use training_plan_json as source of truth; never mention dates or planned sessions not present there."
         )
         user_prompt = quick_encouragement_user_prompt(
@@ -571,14 +623,14 @@ def generate_quick_encouragement(user: User) -> dict[str, Any]:
         text = _normalize_sentences(
             text,
             min_sentences=2,
-            max_sentences=2,
+            max_sentences=3,
             filler="Protect recovery so your key session quality stays high",
         )
         if _mentions_specific_dates(text):
             text = _normalize_sentences(
                 _plan_locked_encouragement_text(ctx["training_plan_json"], weekly),
                 min_sentences=2,
-                max_sentences=2,
+                max_sentences=3,
                 filler="Stay consistent with your current plan.",
             )
         return {"encouragement": text}, {
@@ -591,7 +643,13 @@ def generate_quick_encouragement(user: User) -> dict[str, Any]:
     return payload
 
 
-def answer_general_chat(user: User, message: str, *, max_chars: int = 220) -> dict[str, Any]:
+def answer_general_chat(
+    user: User,
+    message: str,
+    *,
+    max_chars: int = GENERAL_CHAT_MAX_CHARS,
+    chat_history: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
     ctx = _build_context(user)
     if not ctx["ai_settings"]["feature_flags"]["general_chat"]:
         return {"answer": "General chat is disabled.", "source": "feature_disabled", "status": "fallback"}
@@ -601,14 +659,49 @@ def answer_general_chat(user: User, message: str, *, max_chars: int = 220) -> di
     )
     risk_flags = list(ctx["athlete_state_json"].get("fatigue_risk_flags") or [])
     decision = route_model("general_chat", low_confidence=major_replan, risk_flags=risk_flags)
-    system_prompt = SHARED_SYSTEM_POLICY + f" Keep response concise and below {max_chars} chars when practical."
+    max_chars = max(40, min(int(max_chars or GENERAL_CHAT_MAX_CHARS), GENERAL_CHAT_MAX_CHARS))
+    msg = str(message or "").strip()
+    if msg and (len(msg.split()) <= 3) and not _looks_training_related(msg):
+        text = _cap_chars(
+            "I can help with training, pacing, recovery, and race prep. Ask a running-related question and I’ll answer from your data.",
+            max_chars,
+        )
+        interaction = _log_interaction(
+            user=user,
+            mode="general_chat",
+            model="rule_guard",
+            status="success",
+            source="guardrail",
+            response_text=text,
+            system_prompt="general_chat_guard",
+            user_prompt=msg,
+            context_snapshot={"guard": "out_of_scope_short_message"},
+            request_params={"question": msg, "max_chars": max_chars},
+        )
+        return {
+            "answer": text,
+            "source": "guardrail",
+            "status": "success",
+            "interaction_id": interaction.id if interaction else None,
+            "model": "rule_guard",
+        }
+    system_prompt = (
+        SHARED_SYSTEM_POLICY
+        + f" Hard limit: never exceed {max_chars} characters. "
+        + "Reply in concise GitHub-flavored Markdown. Use short sections and bullet points when useful. "
+        + "You may use emojis sparingly. Do not wrap the whole response in a code block."
+        + " If user_message is unrelated to endurance training, fitness, or this app, do not generate a training plan. "
+        + "Instead reply briefly that you can help with training topics and ask for a relevant question."
+    )
     user_prompt = general_chat_user_prompt(
         message,
         ctx["profile_json"],
         ctx["goal_json"],
         ctx["athlete_state_json"],
         ctx["relevant_workouts_json"],
+        ctx.get("recent_10_workouts_json") or [],
         ctx["training_plan_json"],
+        chat_history,
     )
 
     response = OpenAIResponsesClient().complete_text(
@@ -617,7 +710,7 @@ def answer_general_chat(user: User, message: str, *, max_chars: int = 220) -> di
         user_prompt=user_prompt,
         temperature=0.2,
     )
-    text = (response.text or "")[:max_chars].strip()
+    text = _cap_chars(response.text or "", max_chars)
     interaction = _log_interaction(
         user=user,
         mode="general_chat",
@@ -632,6 +725,7 @@ def answer_general_chat(user: User, message: str, *, max_chars: int = 220) -> di
             "goal": ctx["goal_json"],
             "athlete_state": ctx["athlete_state_json"],
             "relevant_workouts": ctx["relevant_workouts_json"],
+            "recent_10_workouts": ctx.get("recent_10_workouts_json") or [],
             "training_plan": ctx["training_plan_json"],
         },
         request_params={"question": message, "max_chars": max_chars},

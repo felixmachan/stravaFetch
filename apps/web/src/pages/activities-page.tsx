@@ -7,6 +7,7 @@ import { Activity, formatDuration, formatPace, km, pacePerKm } from '../lib/anal
 import { Card } from '../components/ui/card';
 import { Input } from '../components/ui/input';
 import { EmptyState } from '../components/ui/empty-state';
+import { Skeleton } from '../components/ui/skeleton';
 
 function SportIcon({ type }: { type: string }) {
   const lower = type.toLowerCase();
@@ -16,10 +17,14 @@ function SportIcon({ type }: { type: string }) {
   return <PersonStanding className='h-8 w-8 text-zinc-400' />;
 }
 
+function kudosAvatarUrl(k: any): string {
+  return String(k?.avatar_url || k?.profile_medium || k?.profile || k?.avatar || k?.picture || '').trim();
+}
+
 export function ActivitiesPage() {
   const [query, setQuery] = useState('');
   const [type, setType] = useState('all');
-  const { data } = useQuery<Activity[]>({ queryKey: ['activities'], queryFn: async () => (await api.get('/activities')).data });
+  const { data, isLoading } = useQuery<Activity[]>({ queryKey: ['activities'], queryFn: async () => (await api.get('/activities')).data });
 
   const filtered = useMemo(() => {
     return (data || []).filter((a) => {
@@ -29,6 +34,9 @@ export function ActivitiesPage() {
     });
   }, [data, query, type]);
 
+  if (isLoading) {
+    return <div className='grid gap-4 md:grid-cols-2'>{Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className='h-44' />)}</div>;
+  }
   if (!data?.length) return <EmptyState />;
 
   return (
@@ -52,6 +60,19 @@ export function ActivitiesPage() {
       <div className='space-y-6 py-2'>
         {filtered.map((activity) => (
           <Link key={activity.id} to={`/activities/${activity.id}`}>
+            {(() => {
+              const highlighted = Array.isArray(activity.highlighted_kudosers) ? activity.highlighted_kudosers : [];
+              const preview = Array.isArray(activity.kudos_preview) ? activity.kudos_preview : [];
+              const merged = [...highlighted, ...preview];
+              const byKey = new Map<string, any>();
+              for (let i = 0; i < merged.length; i += 1) {
+                const item = merged[i];
+                if (!item || typeof item !== 'object') continue;
+                const key = String(item.id ?? item.athlete_id ?? item.display_name ?? `${i}`);
+                if (!byKey.has(key)) byKey.set(key, item);
+              }
+              const kudoers = Array.from(byKey.values()).slice(0, 6);
+              return (
             <Card className='p-6 transition hover:-translate-y-0.5 hover:border-primary/50 mb-4'>
               <div className='grid grid-cols-[auto_1fr_auto] items-center gap-4'>
                 <div className='grid h-14 w-14 place-items-center rounded-2xl border border-border bg-background/60'>
@@ -73,25 +94,42 @@ export function ActivitiesPage() {
                   <p className='text-xl font-semibold'>{formatDuration(activity.moving_time_s)}</p>
                 </div>
                 <div>
-                  <p className='text-xs uppercase tracking-wide text-muted-foreground'>Avg Pace</p>
-                  <p className='text-xl font-semibold'>{formatPace(pacePerKm(activity.distance_m, activity.moving_time_s))}</p>
+                  <p className='text-xs uppercase tracking-wide text-muted-foreground'>
+                    {String(activity.type || '').toLowerCase().includes('swim') ? 'Average 100m' : 'Avg Pace'}
+                  </p>
+                  <p className='text-xl font-semibold'>
+                    {String(activity.type || '').toLowerCase().includes('swim')
+                      ? `${formatDuration(
+                          activity.distance_m > 0 ? (activity.moving_time_s / (activity.distance_m / 100)) : 0
+                        )} /100m`
+                      : formatPace(pacePerKm(activity.distance_m, activity.moving_time_s))}
+                  </p>
                 </div>
               </div>
-              <div className='mt-3 flex flex-wrap gap-2 text-xs'>
-                <span className='rounded-lg border border-border px-2 py-1 text-muted-foreground'>
-                  Achievements: {Number(activity.achievement_count || activity?.raw_payload?.achievement_count || 0)}
-                </span>
-                <span className='rounded-lg border border-border px-2 py-1 text-muted-foreground'>
-                  Kudos: {Number(activity.kudos_count || activity?.raw_payload?.kudos_count || 0)}
-                </span>
-                <span className='rounded-lg border border-border px-2 py-1 text-muted-foreground'>
-                  Power: {(activity.average_watts ?? activity?.raw_payload?.average_watts) ? `${Math.round(Number(activity.average_watts ?? activity?.raw_payload?.average_watts))} W` : 'n/a'}
-                </span>
-                <span className='rounded-lg border border-border px-2 py-1 text-muted-foreground'>
-                  Sync: {activity.fully_synced ? 'Detailed' : 'Summary'}
-                </span>
-              </div>
+              {(kudoers.length > 0) && (
+                <div className='mt-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground'>
+                  <span className='font-medium'>Kudoers:</span>
+                  {kudoers.map((k: any, idx: number) => {
+                    const img = kudosAvatarUrl(k);
+                    const label = k?.display_name || `${k?.firstname || ''} ${k?.lastname || ''}`.trim() || `Athlete ${idx + 1}`;
+                    return (
+                      <span key={`${k?.id || k?.athlete_id || idx}`} className='inline-flex items-center gap-1 rounded-full border border-border px-2 py-1'>
+                        {img ? (
+                          <img src={img} alt={label} className='h-5 w-5 rounded-full object-cover' />
+                        ) : (
+                          <span className='grid h-5 w-5 place-items-center rounded-full bg-muted text-[10px] text-foreground'>
+                            {label.slice(0, 1).toUpperCase()}
+                          </span>
+                        )}
+                        <span>{label}</span>
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
             </Card>
+              );
+            })()}
           </Link>
         ))}
       </div>

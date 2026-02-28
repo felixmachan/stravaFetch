@@ -23,6 +23,7 @@ class PlanDay(BaseModel):
 
 class WeeklyPlanOutput(BaseModel):
     week_start_date: str
+    coach_brief: str
     plan: list[PlanDay]
     weekly_targets: dict
     risk_notes: list[str] = Field(default_factory=list)
@@ -49,9 +50,10 @@ WEEKLY_PLAN_SCHEMA = {
     "schema": {
         "type": "object",
         "additionalProperties": False,
-        "required": ["week_start_date", "plan", "weekly_targets", "risk_notes"],
+        "required": ["week_start_date", "coach_brief", "plan", "weekly_targets", "risk_notes"],
         "properties": {
             "week_start_date": {"type": "string"},
+            "coach_brief": {"type": "string"},
             "plan": {
                 "type": "array",
                 "items": {

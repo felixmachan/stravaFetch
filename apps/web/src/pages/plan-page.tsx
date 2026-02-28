@@ -8,7 +8,6 @@ import { Card } from '../components/ui/card';
 import { Input } from '../components/ui/input';
 import { Progress } from '../components/ui/progress';
 import { Button } from '../components/ui/button';
-import { AiCallout } from '../components/ui/ai-callout';
 
 type GoalPayload = {
   type: 'race' | 'time_trial' | 'annual_km';
@@ -107,12 +106,7 @@ export function PlanPage() {
   const [goal, setGoal] = useState<GoalPayload>({ type: 'race' });
   const [editingGoal, setEditingGoal] = useState(false);
   const [editingWeekly, setEditingWeekly] = useState(false);
-  const [aiPanelOpen, setAiPanelOpen] = useState(false);
-  const [aiTargetText, setAiTargetText] = useState('');
-  const [aiTypedText, setAiTypedText] = useState('');
-  const [aiCursorOn, setAiCursorOn] = useState(true);
   const [nowTick, setNowTick] = useState(Date.now());
-  const aiIsTyping = Boolean(aiTargetText) && aiTypedText.length < aiTargetText.length;
 
   function toggleWeeklyTrainingDay(day: string) {
     setGoal((prev) => {
@@ -191,22 +185,6 @@ export function PlanPage() {
     },
   });
 
-  const askGoalAI = useMutation({
-    mutationFn: async () =>
-      (
-        await api.post('/ai/ask', {
-          mode: 'goal_quick_opinion',
-          question: `Evaluate this goal and provide concise guidance. Goal=${JSON.stringify(goal)}`,
-          max_chars: 300,
-        })
-      ).data,
-    onSuccess: (res) => {
-      setAiTargetText(res?.answer || 'No response generated.');
-      setAiTypedText('');
-      setAiPanelOpen(true);
-    },
-  });
-
   const regenerateWeekPlan = useMutation({
     mutationFn: async () => (await api.post('/plan/generate-week', { force: true })).data,
     onSuccess: () => {
@@ -214,22 +192,6 @@ export function PlanPage() {
       window.dispatchEvent(new CustomEvent('app:toast', { detail: { title: 'Weekly plan updated', message: 'AI generated a fresh weekly plan.' } }));
     },
   });
-
-  useEffect(() => {
-    if (!aiPanelOpen || !aiTargetText) return;
-    if (aiTypedText.length >= aiTargetText.length) return;
-    const t = setTimeout(() => {
-      const nextLen = Math.min(aiTargetText.length, aiTypedText.length + 2);
-      setAiTypedText(aiTargetText.slice(0, nextLen));
-    }, 18);
-    return () => clearTimeout(t);
-  }, [aiPanelOpen, aiTargetText, aiTypedText]);
-
-  useEffect(() => {
-    if (!aiPanelOpen || !aiIsTyping) return;
-    const t = setInterval(() => setAiCursorOn((v) => !v), 450);
-    return () => clearInterval(t);
-  }, [aiPanelOpen, aiIsTyping]);
 
   const distance28d = useMemo(
     () =>
@@ -407,19 +369,6 @@ export function PlanPage() {
           </div>
         )}
 
-        <div className='mt-4 flex items-center gap-2'>
-          <Button variant='outline' onClick={() => { setAiPanelOpen(true); setAiTargetText(''); setAiTypedText(''); askGoalAI.mutate(); }} disabled={askGoalAI.isPending}>
-            {askGoalAI.isPending ? 'Analyzing...' : 'AI quick opinion'}
-          </Button>
-        </div>
-        {aiPanelOpen && (
-          <AiCallout className='mt-3' title='AI Response'>
-            <p className='mt-2 min-h-6 text-sm text-cyan-50'>
-              {aiTypedText}
-              {aiIsTyping ? <span className={`${aiCursorOn ? 'opacity-100' : 'opacity-0'} transition-opacity`}>|</span> : null}
-            </p>
-          </AiCallout>
-        )}
       </Card>
 
       <Card className='p-6'>

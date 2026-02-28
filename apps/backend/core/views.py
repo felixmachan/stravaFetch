@@ -15,13 +15,14 @@ from django.core import signing
 from django.db.models import Q
 from django.http import HttpResponseRedirect
 from django.utils import timezone
-from openai import OpenAI
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from .models import (
     AIFeatureCache,
+    AIChatMessage,
+    AIChatSession,
     AIInteraction,
     Activity,
     ActivityStream,
@@ -476,27 +477,6 @@ def _recent_activity_summary(user: User, days: int = 30):
             f"{a.type} {round((a.distance_m or 0)/1000,2)}km {int((a.moving_time_s or 0)/60)}min hr={int(a.avg_hr) if a.avg_hr else 'n/a'}"
         )
     return "; ".join(lines)
-
-
-def _ask_ai_short(system_prompt: str, user_prompt: str, max_chars: int = 160):
-    key = os.getenv("OPENAI_API_KEY", "")
-    if not key:
-        return "Good direction. Keep load progression steady and focus on quality execution.", "no_api_key"
-    try:
-        client = OpenAI(api_key=key)
-        resp = client.responses.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        text = (resp.output_text or "").strip()
-        if len(text) > max_chars:
-            text = text[: max_chars - 1].rstrip() + "..."
-        return (text or "Solid baseline. Keep consistency and progress gradually."), "openai"
-    except Exception:
-        return "AI temporarily unavailable. Keep easy days easy and maintain consistency this week.", "provider_error"
 
 
 def _telegram_bot_token() -> str:
@@ -992,7 +972,16 @@ def activities(request):
         qs = qs.filter(start_date__date__gte=frm)
     if to := request.GET.get("to"):
         qs = qs.filter(start_date__date__lte=to)
-    return Response(ActivitySerializer(qs.order_by("-start_date")[:200], many=True).data)
+    rows = ActivitySerializer(qs.order_by("-start_date")[:200], many=True).data
+    out = []
+    for row in rows:
+        raw = row.get("raw_payload") if isinstance(row, dict) else {}
+        if not isinstance(raw, dict):
+            raw = {}
+        row["highlighted_kudosers"] = raw.get("highlighted_kudosers") if isinstance(raw.get("highlighted_kudosers"), list) else []
+        row["kudos_preview"] = raw.get("kudos_preview") if isinstance(raw.get("kudos_preview"), list) else []
+        out.append(row)
+    return Response(out)
 
 
 @api_view(["GET"])
@@ -1000,15 +989,24 @@ def activity_detail(request, pk):
     activity = Activity.objects.get(pk=pk, user=request.user)
     stream_row = ActivityStream.objects.filter(activity=activity).values("raw_streams").first()
     stream_payload = (stream_row or {}).get("raw_streams") or {}
+    is_swim = "swim" in str(activity.type or "").lower()
     best_efforts = (activity.raw_payload or {}).get("best_efforts") if isinstance(activity.raw_payload, dict) else []
+    has_core_streams = isinstance(stream_payload.get("time"), list) and isinstance(stream_payload.get("distance"), list)
     needs_enrich = (
         request.GET.get("refresh") == "1"
         or not stream_row
         or not activity.fully_synced
-        or not best_efforts
-        or not isinstance(stream_payload.get("watts"), list)
-        or not isinstance(stream_payload.get("grade_smooth"), list)
+        or (not is_swim and not best_efforts)
+        or not has_core_streams
     )
+    last_attempt_at = activity.streams_synced_at or activity.detail_synced_at
+    rate_limited_recently = (
+        activity.sync_error in {"strava_rate_limited", "detail_http_429"}
+        and last_attempt_at is not None
+        and (timezone.now() - last_attempt_at).total_seconds() < 15 * 60
+    )
+    if rate_limited_recently:
+        needs_enrich = False
     if needs_enrich:
         conn = StravaConnection.objects.filter(user=request.user).first()
         if conn:
@@ -1043,7 +1041,13 @@ def activity_detail(request, pk):
     data["hr_zone_ranges"] = ranges
     data["coach_note"] = CoachNote.objects.filter(activity=activity).order_by("-created_at").values().first()
     data["activity_reaction"] = CoachNote.objects.filter(activity=activity).order_by("-created_at").values().first()
-    data["new_prs"] = podium_prs_from_best_efforts((data.get("raw_payload") or {}).get("best_efforts") or [])
+    raw = data.get("raw_payload") or {}
+    data["best_efforts"] = raw.get("best_efforts") if isinstance(raw, dict) else []
+    data["splits_metric"] = raw.get("splits_metric") if isinstance(raw, dict) else []
+    data["highlighted_kudosers"] = raw.get("highlighted_kudosers") if isinstance(raw, dict) else []
+    data["kudos_preview"] = raw.get("kudos_preview") if isinstance(raw, dict) else []
+    data["map_polyline_points"] = ((raw.get("map") or {}).get("polyline_points") if isinstance(raw, dict) else []) or []
+    data["new_prs"] = podium_prs_from_best_efforts(data.get("best_efforts") or [])
     return Response(data)
 
 
@@ -1186,7 +1190,8 @@ def ai_settings(request):
     if request.method == "PATCH":
         ai["memory_days"] = int(request.data.get("memory_days") or ai.get("memory_days") or 30)
         ai["lookback_days"] = int(request.data.get("lookback_days") or ai.get("lookback_days") or ai["memory_days"] or 15)
-        ai["max_reply_chars"] = int(request.data.get("max_reply_chars") or ai.get("max_reply_chars") or 160)
+        ai["max_reply_chars"] = int(request.data.get("max_reply_chars") or ai.get("max_reply_chars") or 500)
+        ai["max_reply_chars"] = max(40, min(ai["max_reply_chars"], 500))
         ai["ai_model"] = str(request.data.get("ai_model") or ai.get("ai_model") or os.getenv("OPENAI_MODEL", "gpt-5-mini"))
         ai["weekly_plan_enabled"] = _as_bool(request.data.get("weekly_plan_enabled", ai.get("weekly_plan_enabled", True)))
         if "feature_flags" in request.data and isinstance(request.data.get("feature_flags"), dict):
@@ -1214,7 +1219,7 @@ def ai_settings(request):
         {
             "memory_days": int(ai.get("memory_days") or 30),
             "lookback_days": int(ai.get("lookback_days") or ai.get("memory_days") or 15),
-            "max_reply_chars": int(ai.get("max_reply_chars") or 160),
+            "max_reply_chars": int(ai.get("max_reply_chars") or 500),
             "ai_model": str(ai.get("ai_model") or os.getenv("OPENAI_MODEL", "gpt-5-mini")),
             "weekly_plan_enabled": bool(ai.get("weekly_plan_enabled", True)),
             "feature_flags": {
@@ -1239,6 +1244,71 @@ def ai_context_preview(request):
 def ai_onboarding_generate(request):
     result = generate_onboarding_summary(request.user)
     return Response(result)
+
+
+def _chat_title_from_question(question: str) -> str:
+    value = str(question or "").strip()
+    if not value:
+        return "New chat"
+    return value[:80].strip()
+
+
+@api_view(["GET", "POST"])
+def ai_chat_sessions(request):
+    if request.method == "POST":
+        title = _chat_title_from_question(request.data.get("title") or "")
+        row = AIChatSession.objects.create(user=request.user, title=title)
+        return Response({"id": row.id, "title": row.title, "created_at": row.created_at, "updated_at": row.updated_at}, status=201)
+
+    rows = AIChatSession.objects.filter(user=request.user).order_by("-updated_at", "-id")[:100]
+    out = []
+    for s in rows:
+        last = s.messages.order_by("-created_at").first()
+        out.append(
+            {
+                "id": s.id,
+                "title": s.title or "New chat",
+                "created_at": s.created_at,
+                "updated_at": s.updated_at,
+                "last_message_preview": (last.content[:120] if last and last.content else ""),
+            }
+        )
+    return Response(out)
+
+
+@api_view(["GET"])
+def ai_chat_messages(request):
+    sid = int(request.GET.get("session_id") or 0)
+    if sid <= 0:
+        return Response([])
+    session = AIChatSession.objects.filter(id=sid, user=request.user).first()
+    if not session:
+        return Response({"detail": "Session not found"}, status=404)
+    rows = AIChatMessage.objects.filter(session=session).order_by("created_at", "id")[:500]
+    out = []
+    for m in rows:
+        out.append(
+            {
+                "id": m.id,
+                "session_id": session.id,
+                "role": m.role,
+                "content": m.content,
+                "source": m.source,
+                "model": m.model,
+                "interaction_id": m.interaction_id,
+                "created_at": m.created_at,
+            }
+        )
+    return Response(out)
+
+
+@api_view(["DELETE"])
+def ai_chat_session_detail(request, pk):
+    session = AIChatSession.objects.filter(id=pk, user=request.user).first()
+    if not session:
+        return Response({"detail": "Session not found"}, status=404)
+    session.delete()
+    return Response({"ok": True})
 
 
 @api_view(["GET"])
@@ -1346,10 +1416,14 @@ def ai_ask(request):
     schedule = p.schedule or {}
     ai = schedule.get("ai_settings", {})
     memory_days = int(ai.get("memory_days") or 30)
-    max_chars = int(request.data.get("max_chars") or ai.get("max_reply_chars") or 160)
-    max_chars = max(20, min(max_chars, 1200))
     mode = (request.data.get("mode") or "general").strip().lower()
+    max_chars = int(request.data.get("max_chars") or ai.get("max_reply_chars") or 500)
+    if mode == "general_chat":
+        max_chars = max(40, min(max_chars, 500))
+    else:
+        max_chars = max(20, min(max_chars, 1200))
     question = (request.data.get("question") or "").strip()
+    session_id = int(request.data.get("session_id") or 0)
     raw_recent = request.data.get("include_recent_ai_hour", False)
     include_recent_ai_hour = str(raw_recent).lower() in {"1", "true", "yes", "on"}
     related_activity = None
@@ -1361,8 +1435,37 @@ def ai_ask(request):
         related_activity=related_activity,
         include_recent_ai_hour=include_recent_ai_hour,
     )
+    chat_session = None
     if mode == "general_chat":
-        result = answer_general_chat(request.user, question, max_chars=max_chars)
+        if session_id > 0:
+            chat_session = AIChatSession.objects.filter(id=session_id, user=request.user).first()
+            if not chat_session:
+                return Response({"detail": "Session not found"}, status=404)
+        history_rows = (
+            AIChatMessage.objects.filter(session=chat_session).order_by("-created_at", "-id")[:16]
+            if chat_session
+            else []
+        )
+        chat_history = []
+        for msg in reversed(list(history_rows)):
+            if msg.role not in {"user", "assistant"}:
+                continue
+            chat_history.append({"role": msg.role, "content": msg.content or ""})
+        result = answer_general_chat(request.user, question, max_chars=max_chars, chat_history=chat_history)
+        answer_text = str(result.get("answer") or "").strip()
+        if not chat_session and answer_text:
+            chat_session = AIChatSession.objects.create(user=request.user, title=_chat_title_from_question(question))
+        if chat_session:
+            AIChatMessage.objects.create(session=chat_session, role="user", content=question)
+            AIChatMessage.objects.create(
+                session=chat_session,
+                role="assistant",
+                content=answer_text,
+                source=result.get("source") or "",
+                model=result.get("model") or "",
+                interaction_id=result.get("interaction_id"),
+            )
+            AIChatSession.objects.filter(id=chat_session.id).update(updated_at=timezone.now())
     else:
         system_prompt = (
             f"You are a concise endurance coach. Reply in practical and specific style. Never exceed {max_chars} characters. "
@@ -1413,6 +1516,7 @@ def ai_ask(request):
             "memory_count": len(schedule["ai_memory"]),
             "source": source,
             "interaction_id": result["interaction_id"],
+            "session_id": chat_session.id if chat_session else None,
         }
     )
 

@@ -18,7 +18,7 @@ export function SettingsPage() {
     queryFn: async () => (await api.get('/ai/settings')).data as { memory_days: number; max_reply_chars: number },
   });
   const [memoryDays, setMemoryDays] = useState(30);
-  const [maxChars, setMaxChars] = useState(160);
+  const [maxChars, setMaxChars] = useState(500);
   const [deleteConfirm, setDeleteConfirm] = useState('');
   const [manualCode, setManualCode] = useState('');
   const { data: telegramSetup } = useQuery({
@@ -38,7 +38,7 @@ export function SettingsPage() {
   useEffect(() => {
     if (data) {
       setMemoryDays(data.memory_days ?? 30);
-      setMaxChars(data.max_reply_chars ?? 160);
+        setMaxChars(data.max_reply_chars ?? 500);
     }
   }, [data]);
   useEffect(() => {
@@ -204,6 +204,7 @@ export function SettingsPage() {
 
   return (
     <div className='space-y-4'>
+      
       <Card className='p-6'>
         <p className='flex items-center gap-2 text-2xl font-semibold'><Link2 className='h-5 w-5 text-cyan-300' />Integrations</p>
         <p className='mt-1 text-sm text-muted-foreground'>Manage data providers and sync actions.</p>
@@ -317,7 +318,7 @@ export function SettingsPage() {
           </label>
           <label className='space-y-1'>
             <span className='text-sm text-muted-foreground'>Max AI reply chars</span>
-            <Input type='number' value={maxChars} onChange={(e) => setMaxChars(Number(e.target.value || 160))} />
+              <Input type='number' min={40} max={500} value={maxChars} onChange={(e) => setMaxChars(Number(e.target.value || 500))} />
           </label>
         </div>
         <div className='mt-4'>

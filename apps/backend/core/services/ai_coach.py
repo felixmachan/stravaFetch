@@ -31,6 +31,13 @@ from core.services.personal_records import personal_records_snapshot
 from core.services.ai.prompts import SHARED_SYSTEM_POLICY
 
 
+def _limit_sentences(text: str, max_sentences: int = 3) -> str:
+    chunks = [c.strip() for c in str(text or "").replace("\n", " ").split(".") if c.strip()]
+    if not chunks:
+        return ""
+    return ". ".join(chunks[:max_sentences]).strip() + "."
+
+
 def _week_start_monday(date: dt.date | None = None) -> dt.date:
     base = date or timezone.localdate()
     return base - dt.timedelta(days=base.weekday())
@@ -221,19 +228,42 @@ def generate_activity_reaction(user: User, activity: Activity) -> dict[str, Any]
 
 def generate_onboarding_summary(user: User, *, bootstrap_last_n: int | None = None) -> dict[str, Any]:
     snapshot = build_context_snapshot(user, "onboarding", bootstrap_last_n=bootstrap_last_n)
-    system_prompt = SHARED_SYSTEM_POLICY + " Return JSON with summary, success_factors, risks, week_draft."
-    user_prompt = f"context={snapshot}"
+    profile_data = snapshot.get("profile_json") or {}
+    goal_data = snapshot.get("goal_json") or {}
+    athlete_state = snapshot.get("athlete_state_json") or {}
+    weekly_data = snapshot.get("weekly_stats") or {}
+    display_name = str(profile_data.get("display_name") or user.first_name or user.username or "athlete").strip()
+    training_days = list(profile_data.get("availability") or [])
+    system_prompt = (
+        SHARED_SYSTEM_POLICY
+        + " Return a concise onboarding summary in max 3 sentences and max 500 characters. "
+        + "Use GitHub-flavored Markdown for readable formatting (short heading, bullets, optional emoji). "
+        + "Do not wrap everything in a code block."
+    )
+    user_prompt = (
+        "App: Pacepilot (running-focused coaching app). "
+        f"User just registered. Name: {display_name}. "
+        f"profile_json={profile_data} goal_json={goal_data} athlete_state_json={athlete_state} weekly_stats_json={weekly_data}. "
+        f"training_days={training_days}. "
+        "Write a personalized welcome that: "
+        "1) reflects current goal and recent training state, "
+        "2) states one key improvement focus, "
+        "3) gives realistic direction on how to train toward the goal, "
+        "4) explains that Pacepilot auto-generates next-week plan on the configured day based on profile/goals/training data, "
+        "5) mentions progress tracking in Calendar/Plan and that AI Coach Console can answer training questions."
+    )
     result = run_ai_and_log(
         user=user,
         mode="onboarding",
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        max_chars=900,
+        max_chars=500,
         context_snapshot=snapshot,
         request_params={"output": "json"},
     )
+    summary = _limit_sentences(result.get("answer", ""), 3)
     return {
-        "summary": result.get("answer", ""),
+        "summary": summary,
         "success_factors": [],
         "risks": [],
         "week_draft": [],

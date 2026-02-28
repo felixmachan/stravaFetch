@@ -208,6 +208,7 @@ export function LoginPage() {
           if (data.ready) {
             setRegisterProgress(100);
             setOnboardingGate(false);
+            sessionStorage.setItem('pacepilot:show_welcome_once', '1');
             navigate('/');
             return;
           }

@@ -77,6 +77,68 @@ function dayLabel(d: Date) {
   return d.toLocaleDateString(undefined, { weekday: 'short' });
 }
 
+function capText(text: string, maxChars: number) {
+  if ((text || '').length <= maxChars) return text || '';
+  return (text || '').slice(0, maxChars).trimEnd();
+}
+
+function renderInlineMarkdown(text: string) {
+  const parts: Array<{ t: string; bold?: boolean; code?: boolean }> = [];
+  const tokenRegex = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+  let last = 0;
+  let m: RegExpExecArray | null = null;
+  while ((m = tokenRegex.exec(text)) !== null) {
+    if (m.index > last) parts.push({ t: text.slice(last, m.index) });
+    const token = m[0] || '';
+    if (token.startsWith('**') && token.endsWith('**')) parts.push({ t: token.slice(2, -2), bold: true });
+    else if (token.startsWith('`') && token.endsWith('`')) parts.push({ t: token.slice(1, -1), code: true });
+    else parts.push({ t: token });
+    last = m.index + token.length;
+  }
+  if (last < text.length) parts.push({ t: text.slice(last) });
+  return parts.map((p, idx) => {
+    if (p.code) return <code key={idx} className='rounded bg-slate-900/70 px-1 py-0.5 text-cyan-100'>{p.t}</code>;
+    if (p.bold) return <strong key={idx} className='font-semibold text-slate-100'>{p.t}</strong>;
+    return <span key={idx}>{p.t}</span>;
+  });
+}
+
+function MarkdownPreview({ text, className = '' }: { text: string; className?: string }) {
+  const lines = (text || '').replace(/\r/g, '').split('\n');
+  const blocks: any[] = [];
+  let listItems: string[] = [];
+  const flushList = () => {
+    if (!listItems.length) return;
+    blocks.push(
+      <ul key={`list-${blocks.length}`} className='ml-5 list-disc space-y-1'>
+        {listItems.map((item, idx) => <li key={idx}>{renderInlineMarkdown(item)}</li>)}
+      </ul>
+    );
+    listItems = [];
+  };
+  for (const rawLine of lines) {
+    const t = rawLine.trim();
+    if (!t) {
+      flushList();
+      blocks.push(<div key={`sp-${blocks.length}`} className='h-2' />);
+      continue;
+    }
+    const bullet = t.match(/^[-*]\s+(.+)$/);
+    if (bullet) {
+      listItems.push(bullet[1]);
+      continue;
+    }
+    flushList();
+    const h2 = t.match(/^##\s+(.+)$/);
+    const h1 = t.match(/^#\s+(.+)$/);
+    if (h2) blocks.push(<h2 key={`h2-${blocks.length}`} className='text-lg font-semibold text-slate-100'>{renderInlineMarkdown(h2[1])}</h2>);
+    else if (h1) blocks.push(<h1 key={`h1-${blocks.length}`} className='text-xl font-semibold text-slate-100'>{renderInlineMarkdown(h1[1])}</h1>);
+    else blocks.push(<p key={`p-${blocks.length}`}>{renderInlineMarkdown(t)}</p>);
+  }
+  flushList();
+  return <div className={`space-y-1 whitespace-pre-wrap text-slate-200 ${className}`}>{blocks}</div>;
+}
+
 function monthDays(base: Date) {
   const first = new Date(base.getFullYear(), base.getMonth(), 1);
   const last = new Date(base.getFullYear(), base.getMonth() + 1, 0);
@@ -156,6 +218,13 @@ export function DashboardPage() {
   const [showMonth, setShowMonth] = useState(false);
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [showPromptPanel, setShowPromptPanel] = useState(false);
+  const [showWelcomeModal, setShowWelcomeModal] = useState(false);
+  const [welcomeLoaded, setWelcomeLoaded] = useState(false);
+  const [welcomeTarget, setWelcomeTarget] = useState('');
+  const [welcomeTyped, setWelcomeTyped] = useState('');
+  const [welcomeCursorOn, setWelcomeCursorOn] = useState(true);
+  const welcomeIsTyping = Boolean(welcomeTarget) && welcomeTyped.length < welcomeTarget.length;
+  const welcomeFlowEnabled = sessionStorage.getItem('pacepilot:show_welcome_once') === '1';
   const { data: weeklySummaryHistory } = useQuery({
     queryKey: ['ai-history-weekly-summary'],
     queryFn: async () =>
@@ -166,6 +235,16 @@ export function DashboardPage() {
         created_at?: string;
       }>,
     enabled: showPromptPanel,
+  });
+  const { data: onboardingHistory } = useQuery({
+    queryKey: ['ai-history-onboarding'],
+    queryFn: async () =>
+      (await api.get('/ai/history', { params: { mode: 'onboarding' } })).data as Array<{
+        id: number;
+        response_text: string;
+      }>,
+    enabled: welcomeFlowEnabled,
+    refetchInterval: welcomeFlowEnabled ? 2000 : false,
   });
 
   const latest = data?.[0];
@@ -192,7 +271,7 @@ export function DashboardPage() {
     const improve = String((summary.what_to_improve || [])[0] || '').trim();
     const safe = String(summary.safe_adjustment_note || '').trim();
     const parts = [headline, highlight, improve, safe].filter(Boolean);
-    const text = parts.join(' ').trim();
+    const text = capText(parts.join(' ').trim(), 200);
     if (text) {
       if (text === weeklyOpinionTarget) return;
       setWeeklyOpinionTarget(text);
@@ -216,6 +295,34 @@ export function DashboardPage() {
     return () => clearInterval(t);
   }, [weeklyIsTyping]);
 
+  useEffect(() => {
+    if (!welcomeFlowEnabled || welcomeLoaded) return;
+    const latest = (onboardingHistory || [])[0];
+    if (!latest?.id) return;
+    const text = capText(String(latest.response_text || ''), 500);
+    if (!text) return;
+    setWelcomeTarget(text);
+    setWelcomeTyped('');
+    setShowWelcomeModal(true);
+    setWelcomeLoaded(true);
+  }, [onboardingHistory, welcomeFlowEnabled, welcomeLoaded]);
+
+  useEffect(() => {
+    if (!showWelcomeModal || !welcomeTarget) return;
+    if (welcomeTyped.length >= welcomeTarget.length) return;
+    const t = setTimeout(() => {
+      const nextLen = Math.min(welcomeTarget.length, welcomeTyped.length + 2);
+      setWelcomeTyped(welcomeTarget.slice(0, nextLen));
+    }, 18);
+    return () => clearTimeout(t);
+  }, [showWelcomeModal, welcomeTarget, welcomeTyped]);
+
+  useEffect(() => {
+    if (!showWelcomeModal) return;
+    const t = setInterval(() => setWelcomeCursorOn((v) => !v), 450);
+    return () => clearInterval(t);
+  }, [showWelcomeModal]);
+
   if (isLoading) {
     return <div className='grid gap-4 md:grid-cols-3'>{Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className='h-32' />)}</div>;
   }
@@ -231,9 +338,31 @@ export function DashboardPage() {
   const goalRun = Number(goal?.weekly_activity_goal_run || 0);
   const goalSwim = Number(goal?.weekly_activity_goal_swim || 0);
   const goalRide = Number(goal?.weekly_activity_goal_ride || 0);
-
   return (
     <div className='space-y-4'>
+      {showWelcomeModal && (
+        <div className='fixed inset-0 z-[2500] grid place-items-center bg-slate-950/80 p-4'>
+          <div className='w-full max-w-2xl rounded-2xl border border-cyan-400/30 bg-slate-950/95 p-6 shadow-2xl'>
+            <div className='flex items-center justify-between gap-3'>
+              <p className='text-2xl font-semibold text-slate-100'>Welcome to Pacepilot!</p>
+              <button
+                type='button'
+                className='rounded-lg border border-border px-3 py-1 text-sm text-slate-200 hover:border-cyan-400/50'
+                onClick={() => {
+                  sessionStorage.removeItem('pacepilot:show_welcome_once');
+                  setShowWelcomeModal(false);
+                }}
+              >
+                Continue
+              </button>
+            </div>
+            <div className='mt-4 rounded-xl border border-cyan-400/20 bg-cyan-500/5 p-4 text-sm leading-relaxed'>
+              <MarkdownPreview text={welcomeTyped} />
+              {welcomeIsTyping ? <span className={`${welcomeCursorOn ? 'opacity-100' : 'opacity-0'} transition-opacity`}>|</span> : null}
+            </div>
+          </div>
+        </div>
+      )}
       <Card className='p-5'>
         <div className='flex items-center justify-between'>
           <p className='text-lg font-semibold'>Weekly Calendar</p>
