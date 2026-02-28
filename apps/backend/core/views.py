@@ -462,9 +462,8 @@ def onboarding_status_view(request):
     plan_source = str((next_plan.plan_json or {}).get("source") or "") if next_plan else ""
     plan_generated_by_ai = bool(next_plan and plan_source not in {"fallback", "fallback_current_week", "fallback_current_week", "unknown"})
 
-    recent_cutoff = timezone.now() - dt.timedelta(days=10)
     recent_activity_ids = list(
-        Activity.objects.filter(user=user, is_deleted=False, start_date__gte=recent_cutoff).values_list("id", flat=True)
+        Activity.objects.filter(user=user, is_deleted=False).order_by("-start_date").values_list("id", flat=True)[:10]
     )
     recent_count = len(recent_activity_ids)
     ai_reaction_count = (
@@ -473,6 +472,7 @@ def onboarding_status_view(request):
         else 0
     )
     recent_ai_complete = recent_count == ai_reaction_count
+    reaction_progress = int(round((ai_reaction_count / max(1, recent_count)) * 100)) if recent_count else 100
 
     progress = 8
     message = "Creating account"
@@ -486,13 +486,16 @@ def onboarding_status_view(request):
         progress = 62
         message = "All Strava data loaded"
     if plan_generated_by_ai:
-        progress = 80
+        progress = 78
         message = "Weekly AI plan generated"
+    if ai_reaction_count:
+        progress = max(progress, min(94, 78 + int(round(reaction_progress * 0.16))))
+        message = f"AI notes generated for {ai_reaction_count}/{recent_count} recent workouts"
     if recent_ai_complete:
-        progress = max(progress, 92)
-        message = "AI notes created for last 10 days"
+        progress = max(progress, 94)
+        message = "AI notes created for latest 10 workouts"
     if has_onboarding:
-        progress = max(progress, 96)
+        progress = max(progress, 99)
         message = "Finalizing dashboard context"
 
     ready = bool(has_strava and full_sync_complete and plan_generated_by_ai and recent_ai_complete and has_onboarding)
@@ -510,8 +513,9 @@ def onboarding_status_view(request):
             "sync_in_progress": sync_in_progress,
             "next_week_plan_ready": plan_generated_by_ai,
             "recent_ai_complete": recent_ai_complete,
-            "recent_activity_count_10d": recent_count,
-            "recent_ai_note_count_10d": ai_reaction_count,
+            "recent_activity_count": recent_count,
+            "recent_ai_note_count": ai_reaction_count,
+            "reaction_progress": reaction_progress,
             "has_onboarding": has_onboarding,
         }
     )
