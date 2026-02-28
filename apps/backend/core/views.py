@@ -474,6 +474,7 @@ def onboarding_status_view(request):
         else 0
     )
     recent_ai_complete = recent_count == ai_reaction_count
+    reaction_progress = int(round((ai_reaction_count / max(1, recent_count)) * 100)) if recent_count else 100
 
     current_week = timezone.localdate().weekday()
     day_to_idx = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
@@ -501,26 +502,22 @@ def onboarding_status_view(request):
         message = "Syncing all Strava activities"
         details = ["Loading your full activity history"]
     if full_sync_complete:
-        progress = 80
-        message = "Strava sync complete"
-        details = ["Now generating AI artifacts for your dashboard"]
+        progress = 62
+        message = "All Strava data loaded"
+    if plan_generated_by_ai:
+        progress = 78
+        message = "Weekly AI plan generated"
+    if ai_reaction_count:
+        progress = max(progress, min(94, 78 + int(round(reaction_progress * 0.16))))
+        message = f"AI notes generated for {ai_reaction_count}/{recent_count} recent workouts"
+    if recent_ai_complete:
+        progress = max(progress, 94)
+        message = "AI notes created for latest 10 workouts"
+    if has_onboarding:
+        progress = max(progress, 99)
+        message = "Finalizing dashboard context"
 
-    if full_sync_complete:
-        progress = max(progress, 80 + int(round(ai_progress * 0.20)))
-        message = f"Generating AI content ({ai_completed}/{ai_total})"
-        details = [
-            f"Coach notes: {ai_reaction_count}/{recent_count}",
-            f"Weekly summary: {'done' if has_weekly_summary else 'pending'}",
-            f"Daily encouragement: {'done' if has_quick_encouragement else 'pending'}",
-        ]
-        if remaining_plan_sessions:
-            details.append(f"Remaining planned sessions this week: {remaining_plan_sessions}")
-
-    if has_next_week_plan and progress < 99:
-        progress = max(progress, 98)
-        message = "Weekly plan prepared"
-
-    ready = bool(has_strava and full_sync_complete and has_next_week_plan and recent_ai_complete and has_onboarding and has_weekly_summary and has_quick_encouragement)
+    ready = bool(has_strava and full_sync_complete and plan_generated_by_ai and recent_ai_complete and has_onboarding)
     if ready:
         progress = 100
         message = "Onboarding complete"
@@ -539,6 +536,7 @@ def onboarding_status_view(request):
             "recent_ai_complete": recent_ai_complete,
             "recent_activity_count": recent_count,
             "recent_ai_note_count": ai_reaction_count,
+            "reaction_progress": reaction_progress,
             "has_onboarding": has_onboarding,
             "has_weekly_summary": has_weekly_summary,
             "has_quick_encouragement": has_quick_encouragement,

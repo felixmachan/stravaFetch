@@ -59,15 +59,16 @@ def generate_activity_reaction_task(activity_id, user_id):
     except Exception:
         # Onboarding readiness depends on reaction coverage; store a fallback note
         # so a transient AI/provider error cannot stall the registration flow forever.
-        if not CoachNote.objects.filter(activity=activity).exists():
-            CoachNote.objects.create(
-                activity=activity,
-                model="deterministic_fallback",
-                prompt_version="fallback_coach_says",
-                json_output={"source": "fallback", "reason": "reaction_generation_failed"},
-                text_summary="Nice work. Keep the next session easy and controlled while we recover full AI context.",
-                tokens_used=0,
-            )
+        CoachNote.objects.get_or_create(
+            activity=activity,
+            defaults={
+                "model": "deterministic_fallback",
+                "prompt_version": "fallback_coach_says",
+                "json_output": {"source": "fallback", "reason": "reaction_generation_failed"},
+                "text_summary": "Nice work. Keep the next session easy and controlled while we recover full AI context.",
+                "tokens_used": 0,
+            },
+        )
         result = {"answer": "Fallback reaction created.", "source": "fallback", "status": "fallback"}
     refresh_weekly_artifacts_task.delay(user.id)
     return result
