@@ -442,6 +442,8 @@ def register_view(request):
             pass
     _run_background(lambda: generate_onboarding_summary(user, bootstrap_last_n=10))
     _run_background(lambda: generate_weekly_plan(user, force=True, bootstrap_last_n=10))
+    _run_background(lambda: generate_weekly_summary(user))
+    _run_background(lambda: generate_quick_encouragement(user))
     return Response({"tokens": _token_pair(user), "user": _user_payload(user)}, status=201)
 
 
@@ -454,13 +456,13 @@ def onboarding_status_view(request):
     has_strava = bool(strava)
     full_sync_complete = bool(onboarding.get("full_sync_complete"))
     sync_in_progress = bool(onboarding.get("sync_in_progress"))
-    has_onboarding = AIInteraction.objects.filter(user=user, mode="onboarding", status="success").exists()
 
     next_week_start = (timezone.localdate() - dt.timedelta(days=timezone.localdate().weekday())) + dt.timedelta(days=7)
     next_week_end = next_week_start + dt.timedelta(days=6)
     next_plan = TrainingPlan.objects.filter(user=user, status="active", start_date=next_week_start, end_date=next_week_end).first()
-    plan_source = str((next_plan.plan_json or {}).get("source") or "") if next_plan else ""
-    plan_generated_by_ai = bool(next_plan and plan_source not in {"fallback", "fallback_current_week", "fallback_current_week", "unknown"})
+    has_next_week_plan = bool(next_plan)
+
+    has_onboarding = AIInteraction.objects.filter(user=user, mode="onboarding", status="success").exists()
 
     recent_activity_ids = list(
         Activity.objects.filter(user=user, is_deleted=False).order_by("-start_date").values_list("id", flat=True)[:10]
@@ -474,14 +476,31 @@ def onboarding_status_view(request):
     recent_ai_complete = recent_count == ai_reaction_count
     reaction_progress = int(round((ai_reaction_count / max(1, recent_count)) * 100)) if recent_count else 100
 
+    current_week = timezone.localdate().weekday()
+    day_to_idx = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    training_days = [str(d).strip().lower() for d in ((profile.schedule or {}).get("training_days") or [])]
+    remaining_plan_sessions = len([d for d in training_days if day_to_idx.get(d, -1) >= current_week])
+
+    current_week_key = (timezone.localdate() - dt.timedelta(days=timezone.localdate().weekday())).isoformat()
+    has_weekly_summary = AIInteraction.objects.filter(user=user, mode="weekly_summary", status="success").exists()
+    has_quick_encouragement = AIInteraction.objects.filter(user=user, mode="quick_encouragement", status="success").exists()
+
+    ai_total = recent_count + 2 + remaining_plan_sessions
+    ai_completed = ai_reaction_count + (1 if has_weekly_summary else 0) + (1 if has_quick_encouragement else 0)
+    ai_progress = int(round((ai_completed / max(1, ai_total)) * 100)) if ai_total else 100
+
     progress = 8
     message = "Creating account"
+    details = ["Setting up your athlete profile"]
+
     if has_strava:
         progress = 20
         message = "Connected Strava"
+        details = ["Secure account linked with Strava"]
     if has_strava and not full_sync_complete:
         progress = 45
         message = "Syncing all Strava activities"
+        details = ["Loading your full activity history"]
     if full_sync_complete:
         progress = 62
         message = "All Strava data loaded"
@@ -502,21 +521,30 @@ def onboarding_status_view(request):
     if ready:
         progress = 100
         message = "Onboarding complete"
+        details = ["Redirecting to your prepared dashboard"]
 
     return Response(
         {
             "ready": ready,
             "progress": progress,
             "message": message,
+            "details": details,
             "has_strava": has_strava,
             "full_sync_complete": full_sync_complete,
             "sync_in_progress": sync_in_progress,
-            "next_week_plan_ready": plan_generated_by_ai,
+            "next_week_plan_ready": has_next_week_plan,
             "recent_ai_complete": recent_ai_complete,
             "recent_activity_count": recent_count,
             "recent_ai_note_count": ai_reaction_count,
             "reaction_progress": reaction_progress,
             "has_onboarding": has_onboarding,
+            "has_weekly_summary": has_weekly_summary,
+            "has_quick_encouragement": has_quick_encouragement,
+            "remaining_plan_sessions": remaining_plan_sessions,
+            "ai_total": ai_total,
+            "ai_completed": ai_completed,
+            "ai_progress": ai_progress,
+            "weekly_summary_cache_key": current_week_key,
         }
     )
 
