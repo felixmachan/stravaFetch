@@ -37,6 +37,7 @@ export function LoginPage() {
   const [registerProgress, setRegisterProgress] = useState(0);
   const [onboardingGate, setOnboardingGate] = useState(false);
   const [registerBackendMessage, setRegisterBackendMessage] = useState('');
+  const [registerBackendDetails, setRegisterBackendDetails] = useState<string[]>([]);
   const [registerHintText, setRegisterHintText] = useState('');
   const [registerStatusTick, setRegisterStatusTick] = useState(0);
   const [error, setError] = useState('');
@@ -144,15 +145,17 @@ export function LoginPage() {
     if (registerProgress < 78) return 'Generating your weekly structure...';
     if (registerProgress < 92) return 'Finalizing your training plan...';
     return 'Almost done. Preparing your dashboard...';
-  }, [registerProgress]);
+  }, [registerProgress, registerBackendMessage]);
 
   useEffect(() => {
     if (!registerBusy) {
       setRegisterProgress(0);
       setRegisterHintText('');
       setRegisterBackendMessage('');
+      setRegisterBackendDetails([]);
       return;
     }
+    if (onboardingGate) return;
     let pct = 4;
     setRegisterProgress(pct);
     const t = setInterval(() => {
@@ -161,7 +164,7 @@ export function LoginPage() {
       setRegisterProgress(pct);
     }, 1400);
     return () => clearInterval(t);
-  }, [registerBusy]);
+  }, [registerBusy, onboardingGate]);
 
   useEffect(() => {
     if (!registerBusy) return;
@@ -188,8 +191,9 @@ export function LoginPage() {
           const data = res.data || {};
           if (!mounted || stopped) return;
           const pct = Math.max(1, Math.min(100, Number(data.progress || 0)));
-          setRegisterProgress(pct);
+          setRegisterProgress((prev) => Math.max(prev, pct));
           setRegisterBackendMessage(String(data.message || 'Preparing your training setup...'));
+          setRegisterBackendDetails(Array.isArray(data.details) ? data.details.map((x: any) => String(x)) : []);
           if (data.ready) {
             setRegisterProgress(100);
             setOnboardingGate(false);
@@ -251,6 +255,7 @@ export function LoginPage() {
     setError('');
     setBusy(true);
     setRegisterProgress(6);
+    setRegisterBackendDetails([]);
     try {
       await register({
         ...registerForm,
@@ -517,6 +522,13 @@ export function LoginPage() {
           <div className='w-full max-w-xl rounded-2xl border border-cyan-400/30 bg-slate-950/95 p-6 shadow-2xl backdrop-blur-sm'>
             <p className='text-2xl font-semibold text-cyan-100'>Generating your plan...</p>
             <p className='mt-1 text-sm text-slate-300'>Please keep this page open while onboarding finishes.</p>
+            {registerBackendDetails.length > 0 ? (
+              <ul className='mt-2 space-y-1 text-xs text-slate-300'>
+                {registerBackendDetails.map((detail, idx) => (
+                  <li key={`${detail}-${idx}`}>• {detail}</li>
+                ))}
+              </ul>
+            ) : null}
             <div className='mt-5'>
               <div className='mb-1 flex items-center justify-between text-sm'>
                 <span className='text-slate-300'>Progress</span>

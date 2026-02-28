@@ -54,7 +54,21 @@ def refresh_weekly_artifacts_task(user_id):
 def generate_activity_reaction_task(activity_id, user_id):
     user = User.objects.get(id=user_id)
     activity = Activity.objects.get(id=activity_id, user=user)
-    result = generate_activity_reaction_service(user, activity)
+    try:
+        result = generate_activity_reaction_service(user, activity)
+    except Exception:
+        # Onboarding readiness depends on reaction coverage; store a fallback note
+        # so a transient AI/provider error cannot stall the registration flow forever.
+        if not CoachNote.objects.filter(activity=activity).exists():
+            CoachNote.objects.create(
+                activity=activity,
+                model="deterministic_fallback",
+                prompt_version="fallback_coach_says",
+                json_output={"source": "fallback", "reason": "reaction_generation_failed"},
+                text_summary="Nice work. Keep the next session easy and controlled while we recover full AI context.",
+                tokens_used=0,
+            )
+        result = {"answer": "Fallback reaction created.", "source": "fallback", "status": "fallback"}
     refresh_weekly_artifacts_task.delay(user.id)
     return result
 
@@ -124,10 +138,10 @@ def sync_now_for_user(user_id):
     conn.last_polled_at = timezone.now()
     conn.save(update_fields=['last_sync_at', 'last_polled_at'])
 
-    # Ensure last 10 days are fully covered by AI reactions, not only newly created rows.
-    cutoff_recent = timezone.now() - dt.timedelta(days=10)
+    # Ensure onboarding-required latest 10 activities are covered by AI reactions,
+    # not only newly created rows.
     recent_ids = list(
-        Activity.objects.filter(user=user, is_deleted=False, start_date__gte=cutoff_recent).values_list("id", flat=True)
+        Activity.objects.filter(user=user, is_deleted=False).order_by("-start_date").values_list("id", flat=True)[:10]
     )
     noted_ids = set(
         CoachNote.objects.filter(activity_id__in=recent_ids).values_list("activity_id", flat=True).distinct()
