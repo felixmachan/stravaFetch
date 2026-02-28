@@ -1,8 +1,10 @@
 import datetime as dt
 import json
 import os
+import re
 import secrets
 import threading
+import unicodedata
 from urllib.parse import urlencode
 
 import requests
@@ -19,6 +21,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from .models import (
+    AIFeatureCache,
     AIInteraction,
     Activity,
     ActivityStream,
@@ -26,6 +29,7 @@ from .models import (
     CoachNote,
     DerivedMetrics,
     NotificationSettings,
+    PlannedWorkout,
     StravaConnection,
     TelegramConnection,
     TrainingPlan,
@@ -33,6 +37,7 @@ from .models import (
 from .serializers import ActivitySerializer, IntegrationSerializer, PlanSerializer, ProfileSerializer
 from .services.ai_coach import (
     build_context_snapshot,
+    generate_activity_reaction,
     generate_coach_tone,
     generate_onboarding_summary,
     generate_weekly_plan,
@@ -41,6 +46,12 @@ from .services.ai_coach import (
 )
 from .services.ai import answer_general_chat, generate_quick_encouragement, generate_weekly_summary
 from .services.strava import refresh_if_needed, sync_athlete_profile_from_connection, sync_athlete_profile_from_strava
+from .services.planned_workouts import (
+    ensure_week_rows_from_training_plan,
+    refresh_week_statuses,
+    replace_week_plan_rows,
+    serialize_week_plan,
+)
 from .tasks import (
     generate_activity_reaction_task,
     generate_coach_tone_task,
@@ -55,6 +66,21 @@ from .tasks import (
 def _run_background(task):
     t = threading.Thread(target=task, daemon=True)
     t.start()
+
+
+def _bootstrap_initial_ai(user: User, *, target_week_start: dt.date):
+    try:
+        generate_weekly_plan(user, force=True, bootstrap_last_n=10, target_week_start=target_week_start)
+    except Exception:
+        pass
+    try:
+        generate_weekly_summary(user)
+    except Exception:
+        pass
+    try:
+        generate_quick_encouragement(user)
+    except Exception:
+        pass
 
 
 def _token_pair(user: User) -> dict:
@@ -84,6 +110,16 @@ def _as_bool(value) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_username_candidate(value: str) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    ascii_only = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+    cleaned = re.sub(r"[^a-z0-9]+", "_", ascii_only)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned[:150]
 
 
 def _strava_signup_prefill_from_access_token(access_token: str) -> dict:
@@ -122,7 +158,11 @@ def _strava_signup_prefill_from_access_token(access_token: str) -> dict:
     last = (athlete.get("lastname") or "").strip()
     display_name = " ".join([part for part in [first, last] if part]).strip()
     username = (athlete.get("username") or "").strip()
-    suggested_username = (username or f"{first}{last}".lower() or f"athlete{athlete.get('id', '')}").replace(" ", "").lower()
+    full_name_raw = " ".join([part for part in [first, last] if part]).strip()
+    fallback_name = full_name_raw.replace(" ", "_")
+    suggested_username = _normalize_username_candidate(fallback_name) or _normalize_username_candidate(username)
+    if not suggested_username:
+        suggested_username = f"athlete{athlete.get('id', '')}".lower()
     preferred = "Run"
     for bikes_key, swim_key in (("bikes", "swim"),):
         if athlete.get(bikes_key):
@@ -152,6 +192,18 @@ def _goal_int(payload: dict, key: str):
     return int(value)
 
 
+def _sanitize_training_days(days_value) -> list[str]:
+    allowed = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+    if not isinstance(days_value, list):
+        return []
+    out = []
+    for day in days_value:
+        key = str(day).strip().lower()[:3]
+        if key in allowed and key not in out:
+            out.append(key)
+    return out
+
+
 def _profile_from_payload(user: User, payload: dict):
     profile, _ = AthleteProfile.objects.get_or_create(user=user)
     fields = [
@@ -177,10 +229,25 @@ def _profile_from_payload(user: User, payload: dict):
         profile.save(update_fields=list(updates.keys()))
 
     schedule = profile.schedule or {}
+    incoming_training_days = _sanitize_training_days(payload.get("training_days") if "training_days" in payload else schedule.get("training_days"))
     goal_type = payload.get("goal_type")
     if goal_type:
         goal_distance = payload.get("goal_distance_km")
         goal_target_time = payload.get("goal_target_time_min")
+        weekly_total = _goal_int(payload, "weekly_activity_goal_total")
+        weekly_run = _goal_int(payload, "weekly_activity_goal_run")
+        weekly_swim = _goal_int(payload, "weekly_activity_goal_swim")
+        weekly_ride = _goal_int(payload, "weekly_activity_goal_ride")
+        if weekly_total <= 0 and incoming_training_days:
+            weekly_total = len(incoming_training_days)
+        if weekly_run + weekly_swim + weekly_ride <= 0 and weekly_total > 0:
+            primary = str(payload.get("primary_sport") or profile.primary_sport or "Run").strip().lower()
+            if primary == "swim":
+                weekly_swim = weekly_total
+            elif primary in {"ride", "bike", "cycling"}:
+                weekly_ride = weekly_total
+            else:
+                weekly_run = weekly_total
         schedule["goal"] = {
             "type": goal_type,
             "target_distance_km": goal_distance,
@@ -190,19 +257,16 @@ def _profile_from_payload(user: User, payload: dict):
             "event_name": payload.get("goal_event_name") or profile.goal_event_name,
             "event_date": payload.get("goal_event_date") or (str(profile.goal_event_date) if profile.goal_event_date else None),
             "annual_km_goal": payload.get("annual_km_goal"),
-            "weekly_activity_goal_total": _goal_int(payload, "weekly_activity_goal_total"),
-            "weekly_activity_goal_run": _goal_int(payload, "weekly_activity_goal_run"),
-            "weekly_activity_goal_swim": _goal_int(payload, "weekly_activity_goal_swim"),
-            "weekly_activity_goal_ride": _goal_int(payload, "weekly_activity_goal_ride"),
+            "weekly_activity_goal_total": weekly_total,
+            "weekly_activity_goal_run": weekly_run,
+            "weekly_activity_goal_swim": weekly_swim,
+            "weekly_activity_goal_ride": weekly_ride,
             "notes": payload.get("goals") or profile.goals or "",
         }
     if payload.get("birth_date"):
         schedule["birth_date"] = payload.get("birth_date")
     if "training_days" in payload:
-        days = payload.get("training_days") or []
-        if isinstance(days, list):
-            allowed = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
-            schedule["training_days"] = [str(d).strip().lower()[:3] for d in days if str(d).strip().lower()[:3] in allowed]
+        schedule["training_days"] = incoming_training_days
     if payload.get("ai_memory_days") is not None:
         ai = schedule.get("ai_settings", {})
         ai["memory_days"] = int(payload.get("ai_memory_days") or 30)
@@ -215,6 +279,23 @@ def _profile_from_payload(user: User, payload: dict):
             "quick_encouragement": True,
         }
         schedule["ai_settings"] = ai
+    plan_generation = schedule.get("plan_generation", {}) if isinstance(schedule.get("plan_generation"), dict) else {}
+    if "weekly_plan_generation_day" in payload:
+        day = str(payload.get("weekly_plan_generation_day") or "sun").strip().lower()[:3]
+        if day not in {"sat", "sun"}:
+            day = "sun"
+        plan_generation["day"] = day
+    if "weekly_plan_generation_hour" in payload:
+        try:
+            hour = int(payload.get("weekly_plan_generation_hour"))
+        except Exception:
+            hour = 2
+        plan_generation["hour"] = max(0, min(23, hour))
+    if "day" not in plan_generation:
+        plan_generation["day"] = "sun"
+    if "hour" not in plan_generation:
+        plan_generation["hour"] = 2
+    schedule["plan_generation"] = plan_generation
     profile.schedule = schedule
     profile.save(update_fields=["schedule"])
     return profile
@@ -223,6 +304,30 @@ def _profile_from_payload(user: User, payload: dict):
 def _goal_payload(profile: AthleteProfile):
     schedule = profile.schedule or {}
     goal = schedule.get("goal") or {}
+    training_days = _sanitize_training_days(schedule.get("training_days") or [])
+    weekly_total = int(goal.get("weekly_activity_goal_total") or 0)
+    weekly_run = int(goal.get("weekly_activity_goal_run") or 0)
+    weekly_swim = int(goal.get("weekly_activity_goal_swim") or 0)
+    weekly_ride = int(goal.get("weekly_activity_goal_ride") or 0)
+    if weekly_total <= 0 and training_days:
+        weekly_total = len(training_days)
+    if weekly_run + weekly_swim + weekly_ride <= 0 and weekly_total > 0:
+        primary = str(profile.primary_sport or "Run").strip().lower()
+        if primary == "swim":
+            weekly_swim = weekly_total
+        elif primary in {"ride", "bike", "cycling"}:
+            weekly_ride = weekly_total
+        else:
+            weekly_run = weekly_total
+    plan_generation = schedule.get("plan_generation") if isinstance(schedule.get("plan_generation"), dict) else {}
+    plan_day = str(plan_generation.get("day") or "sun").strip().lower()[:3]
+    if plan_day not in {"sat", "sun"}:
+        plan_day = "sun"
+    try:
+        plan_hour = int(plan_generation.get("hour") if plan_generation.get("hour") is not None else 2)
+    except Exception:
+        plan_hour = 2
+    plan_hour = max(0, min(23, plan_hour))
     return {
         "type": goal.get("type") or "race",
         "target_distance_km": goal.get("target_distance_km"),
@@ -232,10 +337,13 @@ def _goal_payload(profile: AthleteProfile):
         "event_name": goal.get("event_name") or profile.goal_event_name,
         "event_date": goal.get("event_date") or (str(profile.goal_event_date) if profile.goal_event_date else None),
         "annual_km_goal": goal.get("annual_km_goal"),
-        "weekly_activity_goal_total": int(goal.get("weekly_activity_goal_total") or 0),
-        "weekly_activity_goal_run": int(goal.get("weekly_activity_goal_run") or 0),
-        "weekly_activity_goal_swim": int(goal.get("weekly_activity_goal_swim") or 0),
-        "weekly_activity_goal_ride": int(goal.get("weekly_activity_goal_ride") or 0),
+        "weekly_activity_goal_total": weekly_total,
+        "weekly_activity_goal_run": weekly_run,
+        "weekly_activity_goal_swim": weekly_swim,
+        "weekly_activity_goal_ride": weekly_ride,
+        "training_days": training_days,
+        "weekly_plan_generation_day": plan_day,
+        "weekly_plan_generation_hour": plan_hour,
         "notes": goal.get("notes") or profile.goals or "",
     }
 
@@ -243,18 +351,76 @@ def _goal_payload(profile: AthleteProfile):
 def _training_days_for_user(user: User):
     profile, _ = AthleteProfile.objects.get_or_create(user=user)
     schedule = profile.schedule or {}
-    raw = schedule.get("training_days") or []
-    allowed = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
-    out = []
-    for day in raw:
-        key = str(day).strip().lower()[:3]
-        if key in allowed and key not in out:
-            out.append(key)
-    return out
+    return _sanitize_training_days(schedule.get("training_days") or [])
 
 
 def _weekday_key(date_obj: dt.date) -> str:
     return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][date_obj.weekday()]
+
+
+def _fallback_current_week_days(user: User, week_start: dt.date, week_end: dt.date) -> list[dict]:
+    profile, _ = AthleteProfile.objects.get_or_create(user=user)
+    goal = _goal_payload(profile)
+    training_days = _training_days_for_user(user)
+    sports = (
+        (["run"] * int(goal.get("weekly_activity_goal_run") or 3))
+        + (["swim"] * int(goal.get("weekly_activity_goal_swim") or 0))
+        + (["ride"] * int(goal.get("weekly_activity_goal_ride") or 0))
+    )
+    if not sports:
+        sports = [str(profile.primary_sport or "run").lower()]
+
+    # Do not create single-day fallback plans over the weekend; next-week plan is generated on Sunday flow.
+    if timezone.localdate().weekday() >= 5:
+        return []
+    # Current-week fallback should not assign workouts to past days or same-day signup.
+    earliest = timezone.localdate() + dt.timedelta(days=1)
+    candidate_dates = [week_start + dt.timedelta(days=i) for i in range(7) if (week_start + dt.timedelta(days=i)) >= earliest and (week_start + dt.timedelta(days=i)) <= week_end]
+    if training_days:
+        candidate_dates = [d for d in candidate_dates if _weekday_key(d) in training_days]
+    if not candidate_dates:
+        return []
+
+    days = []
+    for i, sport in enumerate(sports[: len(candidate_dates)]):
+        d = candidate_dates[i % len(candidate_dates)]
+        days.append(
+            {
+                "date": d.isoformat(),
+                "sport": sport,
+                "duration_min": 45 if sport != "swim" else 35,
+                "distance_km": 8 if sport == "run" else (25 if sport == "ride" else 1.5),
+                "hr_zone": "Z2",
+                "title": f"{sport.title()} aerobic",
+                "workout_type": "aerobic",
+                "coach_notes": f"Keep {sport} effort smooth and controlled. End with good form.",
+                "status": "planned",
+            }
+        )
+    return days
+
+
+def _trim_fallback_current_week_plan(tp: TrainingPlan) -> TrainingPlan:
+    if not tp or not isinstance(tp.plan_json, dict):
+        return tp
+    if str(tp.plan_json.get("source") or "") != "fallback_current_week":
+        return tp
+    days = list(tp.plan_json.get("days") or [])
+    cutoff = (timezone.localdate() + dt.timedelta(days=1)).isoformat()
+    filtered = []
+    for item in days:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "planned")
+        date_key = str(item.get("date") or "")
+        if status == "done" or date_key >= cutoff:
+            filtered.append(item)
+    if len(filtered) != len(days):
+        payload = dict(tp.plan_json)
+        payload["days"] = filtered
+        tp.plan_json = payload
+        tp.save(update_fields=["plan_json", "updated_at"])
+    return tp
 
 
 def _hr_distribution_percent(heartrate: list, hr_zones: list):
@@ -441,9 +607,9 @@ def register_view(request):
         except Exception:
             pass
     _run_background(lambda: generate_onboarding_summary(user, bootstrap_last_n=10))
-    _run_background(lambda: generate_weekly_plan(user, force=True, bootstrap_last_n=10))
-    _run_background(lambda: generate_weekly_summary(user))
-    _run_background(lambda: generate_quick_encouragement(user))
+    current_week_start = timezone.localdate() - dt.timedelta(days=timezone.localdate().weekday())
+    target_week_start = current_week_start + dt.timedelta(days=7) if timezone.localdate().weekday() == 6 else current_week_start
+    _run_background(lambda: _bootstrap_initial_ai(user, target_week_start=target_week_start))
     return Response({"tokens": _token_pair(user), "user": _user_payload(user)}, status=201)
 
 
@@ -456,25 +622,18 @@ def onboarding_status_view(request):
     has_strava = bool(strava)
     full_sync_complete = bool(onboarding.get("full_sync_complete"))
     sync_in_progress = bool(onboarding.get("sync_in_progress"))
+    last_sync_result = onboarding.get("last_sync_result") if isinstance(onboarding.get("last_sync_result"), dict) else {}
+    sync_failed = bool(last_sync_result.get("failed"))
+    sync_error = str(last_sync_result.get("error") or "")
 
     next_week_start = (timezone.localdate() - dt.timedelta(days=timezone.localdate().weekday())) + dt.timedelta(days=7)
     next_week_end = next_week_start + dt.timedelta(days=6)
     next_plan = TrainingPlan.objects.filter(user=user, status="active", start_date=next_week_start, end_date=next_week_end).first()
     has_next_week_plan = bool(next_plan)
+    has_weekly_plan_ai = AIInteraction.objects.filter(user=user, mode="weekly_plan", status="success").exists()
+    plan_generated_by_ai = bool(has_next_week_plan or has_weekly_plan_ai)
 
     has_onboarding = AIInteraction.objects.filter(user=user, mode="onboarding", status="success").exists()
-
-    recent_activity_ids = list(
-        Activity.objects.filter(user=user, is_deleted=False).order_by("-start_date").values_list("id", flat=True)[:10]
-    )
-    recent_count = len(recent_activity_ids)
-    ai_reaction_count = (
-        CoachNote.objects.filter(activity_id__in=recent_activity_ids).values("activity_id").distinct().count()
-        if recent_activity_ids
-        else 0
-    )
-    recent_ai_complete = recent_count == ai_reaction_count
-    reaction_progress = int(round((ai_reaction_count / max(1, recent_count)) * 100)) if recent_count else 100
 
     current_week = timezone.localdate().weekday()
     day_to_idx = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
@@ -485,9 +644,9 @@ def onboarding_status_view(request):
     has_weekly_summary = AIInteraction.objects.filter(user=user, mode="weekly_summary", status="success").exists()
     has_quick_encouragement = AIInteraction.objects.filter(user=user, mode="quick_encouragement", status="success").exists()
 
-    ai_total = recent_count + 2 + remaining_plan_sessions
-    ai_completed = ai_reaction_count + (1 if has_weekly_summary else 0) + (1 if has_quick_encouragement else 0)
-    ai_progress = int(round((ai_completed / max(1, ai_total)) * 100)) if ai_total else 100
+    ai_total = 3
+    ai_completed = (1 if plan_generated_by_ai else 0) + (1 if has_weekly_summary else 0) + (1 if has_quick_encouragement else 0)
+    ai_progress = int(round((ai_completed / max(1, ai_total)) * 100))
 
     progress = 8
     message = "Creating account"
@@ -498,26 +657,28 @@ def onboarding_status_view(request):
         message = "Connected Strava"
         details = ["Secure account linked with Strava"]
     if has_strava and not full_sync_complete:
-        progress = 45
+        progress = 35
         message = "Syncing all Strava activities"
         details = ["Loading your full activity history"]
     if full_sync_complete:
-        progress = 62
+        progress = 50
         message = "All Strava data loaded"
-    if plan_generated_by_ai:
-        progress = 78
-        message = "Weekly AI plan generated"
-    if ai_reaction_count:
-        progress = max(progress, min(94, 78 + int(round(reaction_progress * 0.16))))
-        message = f"AI notes generated for {ai_reaction_count}/{recent_count} recent workouts"
-    if recent_ai_complete:
-        progress = max(progress, 94)
-        message = "AI notes created for latest 10 workouts"
+    if sync_failed:
+        progress = max(progress, 45)
+        message = "Strava sync failed"
+        details = [f"Sync error: {sync_error or 'unknown'}"]
+    if full_sync_complete:
+        progress = max(progress, 50 + int(round(ai_progress * 0.5)))
+        if ai_progress < 34:
+            message = "Generating your weekly AI plan"
+        elif ai_progress < 67:
+            message = "Preparing your weekly AI summary"
+        else:
+            message = "Finalizing your coach context"
     if has_onboarding:
         progress = max(progress, 99)
-        message = "Finalizing dashboard context"
 
-    ready = bool(has_strava and full_sync_complete and plan_generated_by_ai and recent_ai_complete and has_onboarding)
+    ready = bool(has_strava and full_sync_complete and plan_generated_by_ai and has_weekly_summary and has_quick_encouragement and has_onboarding)
     if ready:
         progress = 100
         message = "Onboarding complete"
@@ -532,11 +693,13 @@ def onboarding_status_view(request):
             "has_strava": has_strava,
             "full_sync_complete": full_sync_complete,
             "sync_in_progress": sync_in_progress,
+            "sync_failed": sync_failed,
+            "sync_error": sync_error,
             "next_week_plan_ready": has_next_week_plan,
-            "recent_ai_complete": recent_ai_complete,
-            "recent_activity_count": recent_count,
-            "recent_ai_note_count": ai_reaction_count,
-            "reaction_progress": reaction_progress,
+            "recent_ai_complete": None,
+            "recent_activity_count": 0,
+            "recent_ai_note_count": 0,
+            "reaction_progress": 0,
             "has_onboarding": has_onboarding,
             "has_weekly_summary": has_weekly_summary,
             "has_quick_encouragement": has_quick_encouragement,
@@ -843,19 +1006,22 @@ def activity_detail(request, pk):
     data["derived_metrics"] = metrics or {}
     data["hr_zone_ranges"] = ranges
     data["coach_note"] = CoachNote.objects.filter(activity=activity).order_by("-created_at").values().first()
-    data["activity_reaction"] = (
-        CoachNote.objects.filter(activity=activity, prompt_version="v2_activity_reaction")
-        .order_by("-created_at")
-        .values()
-        .first()
-    )
+    data["activity_reaction"] = CoachNote.objects.filter(activity=activity).order_by("-created_at").values().first()
     return Response(data)
 
 
 @api_view(["POST"])
 def regenerate(request, pk):
-    Activity.objects.get(pk=pk, user=request.user)
-    return Response({"detail": "Regenerate note is disabled in AI Coaching v2."}, status=410)
+    activity = Activity.objects.get(pk=pk, user=request.user)
+    existing = CoachNote.objects.filter(activity=activity).exists()
+    if existing:
+        return Response({"detail": "AI reaction already exists for this workout. Regeneration is disabled."}, status=409)
+    inline = settings.DEBUG or os.getenv("CELERY_TASK_ALWAYS_EAGER", "1") == "1"
+    if inline:
+        result = generate_activity_reaction(request.user, activity)
+        return Response({"queued": False, "generated": True, "result": result})
+    generate_activity_reaction_task.delay(activity.id, request.user.id)
+    return Response({"queued": True, "generated": False})
 
 
 @api_view(["GET", "PATCH"])
@@ -915,6 +1081,30 @@ def goal_settings(request):
         if "notes" in payload:
             goal["notes"] = payload.get("notes") or ""
 
+        schedule = p.schedule or {}
+        if "training_days" in payload:
+            incoming_training_days = _sanitize_training_days(payload.get("training_days"))
+            schedule["training_days"] = incoming_training_days
+            if "weekly_activity_goal_total" not in payload:
+                goal["weekly_activity_goal_total"] = len(incoming_training_days)
+        plan_generation = schedule.get("plan_generation") if isinstance(schedule.get("plan_generation"), dict) else {}
+        if "weekly_plan_generation_day" in payload:
+            day = str(payload.get("weekly_plan_generation_day") or "sun").strip().lower()[:3]
+            if day not in {"sat", "sun"}:
+                day = "sun"
+            plan_generation["day"] = day
+        if "weekly_plan_generation_hour" in payload:
+            try:
+                hour = int(payload.get("weekly_plan_generation_hour"))
+            except Exception:
+                hour = 2
+            plan_generation["hour"] = max(0, min(23, hour))
+        if "day" not in plan_generation:
+            plan_generation["day"] = "sun"
+        if "hour" not in plan_generation:
+            plan_generation["hour"] = 2
+        schedule["plan_generation"] = plan_generation
+
         if min(
             goal["weekly_activity_goal_total"],
             goal["weekly_activity_goal_run"],
@@ -935,7 +1125,6 @@ def goal_settings(request):
             if not goal.get("has_time_goal"):
                 goal["target_time_min"] = None
 
-        schedule = p.schedule or {}
         schedule["goal"] = goal
         p.schedule = schedule
         p.goal_event_name = goal.get("event_name") or ""
@@ -1042,7 +1231,64 @@ def ai_history(request):
 
 @api_view(["GET"])
 def ai_weekly_summary(request):
-    return Response(generate_weekly_summary(request.user))
+    today = timezone.localdate()
+    week_start = today - dt.timedelta(days=today.weekday())
+    week_end = week_start + dt.timedelta(days=6)
+    workouts = list(
+        Activity.objects.filter(
+            user=request.user,
+            is_deleted=False,
+            start_date__date__gte=week_start,
+            start_date__date__lte=week_end,
+        ).order_by("-start_date")
+    )
+    last_workout = workouts[0] if workouts else None
+    cache_key = f"{week_start.isoformat()}:{last_workout.id if last_workout else 0}"
+    cached = AIFeatureCache.objects.filter(user=request.user, feature="weekly_summary", cache_key=cache_key).first()
+    summary = cached.payload_json if cached and isinstance(cached.payload_json, dict) else {}
+    can_generate = bool(last_workout and not cached)
+    reason = ""
+    if not last_workout:
+        reason = "No workouts this week yet."
+    elif cached:
+        reason = "Weekly review is up to date for the latest workout."
+    cta = f"Generate new weekly review considering today's {last_workout.name}" if can_generate else ""
+    return Response(
+        {
+            "summary": summary,
+            "can_generate": can_generate,
+            "reason": reason,
+            "cta": cta,
+            "week_start": week_start.isoformat(),
+            "week_end": week_end.isoformat(),
+            "workouts_this_week": len(workouts),
+            "latest_workout_name": last_workout.name if last_workout else "",
+        }
+    )
+
+
+@api_view(["POST"])
+def ai_weekly_summary_generate(request):
+    today = timezone.localdate()
+    week_start = today - dt.timedelta(days=today.weekday())
+    week_end = week_start + dt.timedelta(days=6)
+    workouts = list(
+        Activity.objects.filter(
+            user=request.user,
+            is_deleted=False,
+            start_date__date__gte=week_start,
+            start_date__date__lte=week_end,
+        ).order_by("-start_date")
+    )
+    last_workout = workouts[0] if workouts else None
+    if not last_workout:
+        return Response({"detail": "No workouts this week yet."}, status=400)
+    cache_key = f"{week_start.isoformat()}:{last_workout.id if last_workout else 0}"
+    cached = AIFeatureCache.objects.filter(user=request.user, feature="weekly_summary", cache_key=cache_key).first()
+    if cached:
+        return Response({"detail": "Weekly review already generated for latest workout."}, status=409)
+    payload = generate_weekly_summary(request.user)
+    return Response({"generated": True, "summary": payload})
 
 
 @api_view(["GET"])
@@ -1136,31 +1382,7 @@ def current_week_plan(request):
     tp = TrainingPlan.objects.filter(user=request.user, status="active", start_date__lte=week_end, end_date__gte=week_start).order_by("-start_date").first()
     if not tp:
         # Ensure dashboard has a visible plan for current week.
-        profile, _ = AthleteProfile.objects.get_or_create(user=request.user)
-        goal = _goal_payload(profile)
-        training_days = _training_days_for_user(request.user)
-        sports = (["run"] * int(goal.get("weekly_activity_goal_run") or 3)) + (["swim"] * int(goal.get("weekly_activity_goal_swim") or 0)) + (["ride"] * int(goal.get("weekly_activity_goal_ride") or 0))
-        if not sports:
-            sports = [str(profile.primary_sport or "run").lower()]
-        candidate_dates = [week_start + dt.timedelta(days=i) for i in range(7)]
-        if training_days:
-            candidate_dates = [d for d in candidate_dates if _weekday_key(d) in training_days] or candidate_dates
-        days = []
-        for i, sport in enumerate(sports[: max(1, len(candidate_dates))]):
-            d = candidate_dates[i % len(candidate_dates)]
-            days.append(
-                {
-                    "date": d.isoformat(),
-                    "sport": sport,
-                    "duration_min": 45 if sport != "swim" else 35,
-                    "distance_km": 8 if sport == "run" else (25 if sport == "ride" else 1.5),
-                    "hr_zone": "Z2",
-                    "title": f"{sport.title()} aerobic",
-                    "workout_type": "aerobic",
-                    "coach_notes": f"Keep {sport} effort smooth and controlled. End with good form.",
-                    "status": "planned",
-                }
-            )
+        days = _fallback_current_week_days(request.user, week_start, week_end)
         tp = TrainingPlan.objects.create(
             user=request.user,
             status="active",
@@ -1168,18 +1390,29 @@ def current_week_plan(request):
             end_date=week_end,
             plan_json={"week_start": week_start.isoformat(), "week_end": week_end.isoformat(), "days": days, "source": "fallback_current_week"},
         )
-    tp = refresh_week_plan_status(request.user, tp)
-    return Response(tp.plan_json or {})
+        replace_week_plan_rows(
+            request.user,
+            week_start=week_start,
+            week_end=week_end,
+            days=days,
+            training_plan=tp,
+            source="fallback_current_week",
+        )
+    else:
+        ensure_week_rows_from_training_plan(request.user, tp)
+    refresh_week_statuses(request.user, week_start, week_end)
+    return Response(serialize_week_plan(request.user, week_start, week_end))
 
 
 @api_view(["POST"])
 def generate_week_plan(request):
     force = bool(request.data.get("force", True))
+    current_week_start = timezone.localdate() - dt.timedelta(days=timezone.localdate().weekday())
     inline = settings.DEBUG or os.getenv("CELERY_TASK_ALWAYS_EAGER", "1") == "1"
     if inline:
-        result = generate_weekly_plan(request.user, force=force)
+        result = generate_weekly_plan(request.user, force=force, target_week_start=current_week_start)
         return Response(result)
-    generate_weekly_plan_task.delay(request.user.id, force)
+    generate_weekly_plan_task.delay(request.user.id, force, current_week_start.isoformat())
     return Response({"queued": True})
 
 
@@ -1212,31 +1445,7 @@ def next_workout(request):
     week_end = week_start + dt.timedelta(days=6)
     tp = TrainingPlan.objects.filter(user=request.user, status="active", start_date__lte=week_end, end_date__gte=week_start).order_by("-start_date").first()
     if not tp:
-        profile, _ = AthleteProfile.objects.get_or_create(user=request.user)
-        goal = _goal_payload(profile)
-        training_days = _training_days_for_user(request.user)
-        sports = (["run"] * int(goal.get("weekly_activity_goal_run") or 3)) + (["swim"] * int(goal.get("weekly_activity_goal_swim") or 0)) + (["ride"] * int(goal.get("weekly_activity_goal_ride") or 0))
-        if not sports:
-            sports = [str(profile.primary_sport or "run").lower()]
-        candidate_dates = [week_start + dt.timedelta(days=i) for i in range(7)]
-        if training_days:
-            candidate_dates = [d for d in candidate_dates if _weekday_key(d) in training_days] or candidate_dates
-        plan_days = []
-        for i, sport in enumerate(sports[: max(1, len(candidate_dates))]):
-            d = candidate_dates[i % len(candidate_dates)]
-            plan_days.append(
-                {
-                    "date": d.isoformat(),
-                    "sport": sport,
-                    "duration_min": 45 if sport != "swim" else 35,
-                    "distance_km": 8 if sport == "run" else (25 if sport == "ride" else 1.5),
-                    "hr_zone": "Z2",
-                    "title": f"{sport.title()} aerobic",
-                    "workout_type": "aerobic",
-                    "coach_notes": f"Keep {sport} effort smooth and controlled. End with good form.",
-                    "status": "planned",
-                }
-            )
+        plan_days = _fallback_current_week_days(request.user, week_start, week_end)
         tp = TrainingPlan.objects.create(
             user=request.user,
             status="active",
@@ -1244,17 +1453,51 @@ def next_workout(request):
             end_date=week_end,
             plan_json={"week_start": week_start.isoformat(), "week_end": week_end.isoformat(), "days": plan_days, "source": "fallback_current_week"},
         )
-        days = plan_days
+        replace_week_plan_rows(
+            request.user,
+            week_start=week_start,
+            week_end=week_end,
+            days=plan_days,
+            training_plan=tp,
+            source="fallback_current_week",
+        )
     else:
-        tp = refresh_week_plan_status(request.user, tp)
-        days = (tp.plan_json or {}).get("days") or []
-    today = timezone.localdate().isoformat()
-    for item in days:
-        if item.get("status") == "planned" and item.get("date", "") >= today:
-            return Response(item)
-    for item in days:
-        if item.get("status") == "planned":
-            return Response(item)
+        ensure_week_rows_from_training_plan(request.user, tp)
+    refresh_week_statuses(request.user, week_start, week_end)
+    rows = list(
+        PlannedWorkout.objects.filter(user=request.user, week_start=week_start, week_end=week_end).order_by("planned_date", "sort_order", "id")
+    )
+    today = timezone.localdate()
+    for row in rows:
+        if row.status == "planned" and row.planned_date >= today:
+            return Response(
+                {
+                    "date": row.planned_date.isoformat(),
+                    "sport": row.sport,
+                    "duration_min": row.duration_min,
+                    "distance_km": row.distance_km,
+                    "hr_zone": row.hr_zone,
+                    "title": row.title,
+                    "workout_type": row.workout_type,
+                    "coach_notes": row.coach_notes,
+                    "status": row.status,
+                }
+            )
+    for row in rows:
+        if row.status == "planned":
+            return Response(
+                {
+                    "date": row.planned_date.isoformat(),
+                    "sport": row.sport,
+                    "duration_min": row.duration_min,
+                    "distance_km": row.distance_km,
+                    "hr_zone": row.hr_zone,
+                    "title": row.title,
+                    "workout_type": row.workout_type,
+                    "coach_notes": row.coach_notes,
+                    "status": row.status,
+                }
+            )
     return Response({})
 
 
@@ -1459,7 +1702,6 @@ def import_demo_activity(request):
             "best_effort_estimates": {"5k": 1320, "10k": 2740},
         },
     )
-    generate_activity_reaction_task.delay(activity.id, request.user.id)
     return Response({"ok": True, "activity_id": activity.id})
 
 

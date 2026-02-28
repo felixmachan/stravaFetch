@@ -5,6 +5,7 @@ import { Bike, PersonStanding, Target, Waves } from '../components/ui/icons';
 import { api } from '../lib/api';
 import { Card } from '../components/ui/card';
 import { Button } from '../components/ui/button';
+import { AiCallout } from '../components/ui/ai-callout';
 
 type PlannedSession = {
   date: string;
@@ -86,9 +87,9 @@ export function PlanWorkoutPage() {
           <Target className='h-4 w-4 text-emerald-300' />
           <p className='text-lg font-semibold'>Coach Brief</p>
         </div>
-        <p className='mt-3 rounded-xl border border-cyan-400/30 bg-cyan-500/10 p-3 text-sm text-cyan-100'>
+        <AiCallout className='mt-3' title='AI Coach Brief'>
           {session.coach_notes || 'Execute with control, hold target intensity, and finish with clean technique.'}
-        </p>
+        </AiCallout>
       </Card>
     </div>
   );

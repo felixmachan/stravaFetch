@@ -92,6 +92,34 @@ class TrainingPlan(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
 
+class PlannedWorkout(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    training_plan = models.ForeignKey(TrainingPlan, null=True, blank=True, on_delete=models.SET_NULL)
+    week_start = models.DateField()
+    week_end = models.DateField()
+    planned_date = models.DateField()
+    sport = models.CharField(max_length=32, default="run")
+    duration_min = models.IntegerField(default=0)
+    distance_km = models.FloatField(null=True, blank=True)
+    hr_zone = models.CharField(max_length=16, blank=True)
+    title = models.CharField(max_length=255, blank=True)
+    workout_type = models.CharField(max_length=64, blank=True)
+    coach_notes = models.TextField(blank=True)
+    status = models.CharField(max_length=16, default="planned")
+    sort_order = models.PositiveIntegerField(default=0)
+    source = models.CharField(max_length=32, default="plan_json")
+    meta_json = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "week_start", "planned_date", "sort_order")
+        indexes = [
+            models.Index(fields=["user", "week_start", "planned_date"]),
+            models.Index(fields=["user", "planned_date", "status"]),
+        ]
+
+
 class NotificationSettings(models.Model):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     email_enabled = models.BooleanField(default=False)

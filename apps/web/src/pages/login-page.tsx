@@ -27,6 +27,67 @@ const TRAINING_DAYS = [
   { key: 'sun', label: 'Sun' },
 ] as const;
 
+function toIsoDate(value: Date): string {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const day = String(value.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function datePlusDays(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return toIsoDate(d);
+}
+
+function buildInitialRegisterForm() {
+  const prefillEnabled = import.meta.env.DEV && String(import.meta.env.VITE_PREFILL_REGISTRATION ?? '1') !== '0';
+  if (!prefillEnabled) {
+    return {
+      username: '',
+      email: '',
+      password: '',
+      display_name: '',
+      primary_sport: '',
+      birth_date: '',
+      height_cm: '',
+      weight_kg: '',
+      goals: '',
+      goal_type: 'race',
+      goal_event_name: '',
+      goal_event_date: '',
+      goal_distance_km: '',
+      has_time_goal_for_race: false,
+      goal_target_time_min: '',
+      annual_km_goal: '',
+      ai_memory_days: '30',
+      training_days: ['mon', 'wed', 'fri'] as string[],
+      strava_signup_token: '',
+    };
+  }
+  return {
+    username: 'felix_machan',
+    email: 'felix.machan@gmail.com',
+    password: 'test123456',
+    display_name: 'Felix',
+    primary_sport: 'Run',
+    birth_date: '2002-08-07',
+    height_cm: '188',
+    weight_kg: '77',
+    goals: 'Sub-1:45 half marathon while keeping recovery safe.',
+    goal_type: 'race',
+    goal_event_name: 'Vivicitta Felmaraton Budapest',
+    goal_event_date: datePlusDays(30),
+    goal_distance_km: '21.1',
+    has_time_goal_for_race: false,
+    goal_target_time_min: '',
+    annual_km_goal: '',
+    ai_memory_days: '10',
+    training_days: ['tue', 'thu', 'fri', 'sun'] as string[],
+    strava_signup_token: '',
+  };
+}
+
 export function LoginPage() {
   const { isAuthenticated, login, register, loginAsAdmin, loading } = useAuth();
   const navigate = useNavigate();
@@ -39,33 +100,12 @@ export function LoginPage() {
   const [registerBackendMessage, setRegisterBackendMessage] = useState('');
   const [registerBackendDetails, setRegisterBackendDetails] = useState<string[]>([]);
   const [registerHintText, setRegisterHintText] = useState('');
-  const [registerStatusTick, setRegisterStatusTick] = useState(0);
   const [error, setError] = useState('');
   const [stravaLinkedForSignup, setStravaLinkedForSignup] = useState(false);
   const [stravaAvatar, setStravaAvatar] = useState('');
 
   const [loginForm, setLoginForm] = useState({ usernameOrEmail: '', password: '' });
-  const [registerForm, setRegisterForm] = useState({
-    username: '',
-    email: '',
-    password: '',
-    display_name: '',
-    primary_sport: '',
-    birth_date: '',
-    height_cm: '',
-    weight_kg: '',
-    goals: '',
-    goal_type: 'race',
-    goal_event_name: '',
-    goal_event_date: '',
-    goal_distance_km: '',
-    has_time_goal_for_race: false,
-    goal_target_time_min: '',
-    annual_km_goal: '',
-    ai_memory_days: '30',
-    training_days: ['mon', 'wed', 'fri'] as string[],
-    strava_signup_token: '',
-  });
+  const [registerForm, setRegisterForm] = useState(buildInitialRegisterForm);
 
   useEffect(() => {
     document.documentElement.classList.add('dark');
@@ -115,10 +155,6 @@ export function LoginPage() {
     };
   }, [searchParams, setSearchParams]);
 
-  if (!loading && isAuthenticated && !onboardingGate) {
-    return <Navigate to='/' replace />;
-  }
-
   const registerReady = useMemo(() => {
     const base = Boolean(registerForm.username && registerForm.email && registerForm.password && registerForm.primary_sport && registerForm.goal_type);
     if (!base) return false;
@@ -129,13 +165,6 @@ export function LoginPage() {
     return true;
   }, [registerForm]);
   const registerBusy = mode === 'register' && (busy || onboardingGate);
-  const registerHints = useMemo(() => {
-    if (registerProgress < 20) return ['Creating athlete profile...', 'Setting up secure account context...'];
-    if (registerProgress < 45) return ['Evaluating your athlete identity...', 'Checking your current pace baseline...'];
-    if (registerProgress < 70) return ['Syncing latest Strava activities...', 'Analyzing available HR context...'];
-    if (registerProgress < 88) return ['Creating your training plan...', 'Balancing load and recovery...'];
-    return ['Finalizing your week plan...', 'Preparing your dashboard and coach notes...'];
-  }, [registerProgress]);
   const registerStatus = useMemo(() => {
     if (registerBackendMessage) return registerBackendMessage;
     if (registerProgress < 12) return 'Creating your account...';
@@ -155,29 +184,8 @@ export function LoginPage() {
       setRegisterBackendDetails([]);
       return;
     }
-    if (onboardingGate) return;
-    let pct = 4;
-    setRegisterProgress(pct);
-    const t = setInterval(() => {
-      const step = Math.max(1, Math.ceil((100 - pct) / 8));
-      pct = Math.min(96, pct + step);
-      setRegisterProgress(pct);
-    }, 1400);
-    return () => clearInterval(t);
+    if (!registerHintText) setRegisterHintText('Preparing onboarding pipeline...');
   }, [registerBusy, onboardingGate]);
-
-  useEffect(() => {
-    if (!registerBusy) return;
-    const t = setInterval(() => setRegisterStatusTick((v) => v + 1), 2200);
-    return () => clearInterval(t);
-  }, [registerBusy]);
-
-  useEffect(() => {
-    if (!registerBusy) return;
-    const options = registerHints;
-    if (!options.length) return;
-    setRegisterHintText(options[registerStatusTick % options.length]);
-  }, [registerHints, registerBusy, registerStatusTick]);
 
   useEffect(() => {
     if (!onboardingGate || !isAuthenticated) return;
@@ -213,6 +221,10 @@ export function LoginPage() {
       stopped = true;
     };
   }, [onboardingGate, isAuthenticated, navigate]);
+
+  if (!loading && isAuthenticated && !onboardingGate) {
+    return <Navigate to='/' replace />;
+  }
 
   async function submitLogin() {
     setError('');

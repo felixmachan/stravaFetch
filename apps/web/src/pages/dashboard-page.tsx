@@ -1,6 +1,6 @@
-﻿import { Bike, HeartPulse, PersonStanding, Waves } from '../components/ui/icons';
+import { Bike, PersonStanding, Waves } from '../components/ui/icons';
 import { useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { LatLngBounds } from 'leaflet';
@@ -22,6 +22,7 @@ import { decodePolyline } from '../lib/polyline';
 import { Card, CardTitle, CardValue } from '../components/ui/card';
 import { EmptyState } from '../components/ui/empty-state';
 import { Skeleton } from '../components/ui/skeleton';
+import { AiCallout } from '../components/ui/ai-callout';
 
 type GoalPayload = {
   weekly_activity_goal_total?: number;
@@ -37,7 +38,7 @@ type PlannedSession = {
   distance_km?: number;
   hr_zone?: string;
   title?: string;
-  status?: 'planned' | 'done' | 'missed';
+  status?: 'planned' | 'done' | 'partial_done' | 'missed';
 };
 
 type WeekPlan = {
@@ -51,7 +52,7 @@ type NextWorkout = PlannedSession;
 function FitRouteBounds({ points }: { points: [number, number][] }) {
   const map = useMap();
   if (points.length > 1) {
-    map.fitBounds(new LatLngBounds(points), { padding: [24, 24], maxZoom: 14 });
+    map.fitBounds(new LatLngBounds(points), { padding: [8, 8], maxZoom: 17 });
   }
   return null;
 }
@@ -113,20 +114,40 @@ function SportIcons({ items }: { items: Activity[] }) {
 
 export function DashboardPage() {
   const navigate = useNavigate();
+  const qc = useQueryClient();
   const { data, isLoading } = useQuery<Activity[]>({ queryKey: ['activities'], queryFn: async () => (await api.get('/activities')).data });
   const { data: goal } = useQuery<GoalPayload>({ queryKey: ['goal'], queryFn: async () => (await api.get('/goal')).data });
   const { data: weekPlan } = useQuery<WeekPlan>({ queryKey: ['plan-current-week'], queryFn: async () => (await api.get('/plan/current-week')).data });
   const { data: nextWorkout } = useQuery<NextWorkout>({ queryKey: ['next-workout'], queryFn: async () => (await api.get('/next-workout')).data });
-  const { data: coachToneData } = useQuery<{ response_text?: string }>({ queryKey: ['coach-tone'], queryFn: async () => (await api.get('/coach-tone')).data });
-  const { data: aiHistory } = useQuery({
-    queryKey: ['ai-history-weekly-opinion'],
+  const { data: quickEncouragement } = useQuery({
+    queryKey: ['ai-quick-encouragement'],
+    queryFn: async () => (await api.get('/ai/quick-encouragement')).data as { encouragement?: string },
+  });
+  const { data: weeklySummary } = useQuery({
+    queryKey: ['ai-weekly-summary'],
     queryFn: async () =>
-      (await api.get('/ai/history', { params: { mode: 'coach_tone' } })).data as Array<{
-        id: number;
-        question: string;
-        response_text: string;
-        created_at: string;
-      }>,
+      (await api.get('/ai/weekly-summary')).data as {
+        summary?: {
+          headline?: string;
+          highlights?: string[];
+          what_to_improve?: string[];
+          next_week_focus?: string[];
+          safe_adjustment_note?: string;
+        };
+        can_generate?: boolean;
+        reason?: string;
+        cta?: string;
+      },
+  });
+  const generateWeeklyReview = useMutation({
+    mutationFn: async () => (await api.post('/ai/weekly-summary/generate')).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['ai-weekly-summary'] });
+      window.dispatchEvent(new CustomEvent('app:toast', { detail: { title: 'Weekly review generated', message: 'AI weekly progress is updated.' } }));
+    },
+    onError: (err: any) => {
+      window.dispatchEvent(new CustomEvent('app:toast', { detail: { title: 'Cannot generate weekly review', message: err?.response?.data?.detail || 'Try again after a new workout.' } }));
+    },
   });
   const [weeklyOpinionTarget, setWeeklyOpinionTarget] = useState('');
   const [weeklyOpinionTyped, setWeeklyOpinionTyped] = useState('');
@@ -134,6 +155,18 @@ export function DashboardPage() {
   const weeklyIsTyping = Boolean(weeklyOpinionTarget) && weeklyOpinionTyped.length < weeklyOpinionTarget.length;
   const [showMonth, setShowMonth] = useState(false);
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
+  const [showPromptPanel, setShowPromptPanel] = useState(false);
+  const { data: weeklySummaryHistory } = useQuery({
+    queryKey: ['ai-history-weekly-summary'],
+    queryFn: async () =>
+      (await api.get('/ai/history', { params: { mode: 'weekly_summary' } })).data as Array<{
+        id: number;
+        prompt_system?: string;
+        prompt_user?: string;
+        created_at?: string;
+      }>,
+    enabled: showPromptPanel,
+  });
 
   const latest = data?.[0];
   const trends = useMemo(() => groupByWeek(data || [], 28), [data]);
@@ -153,18 +186,19 @@ export function DashboardPage() {
   }, [weekPlan]);
 
   useEffect(() => {
-    if (weeklyOpinionTarget) return;
-    const latest = (aiHistory || [])[0];
-    if (latest?.response_text) {
-      setWeeklyOpinionTarget(latest.response_text);
-      setWeeklyOpinionTyped(latest.response_text);
-      return;
+    const summary = weeklySummary?.summary || {};
+    const headline = String(summary.headline || '').trim();
+    const highlight = String((summary.highlights || [])[0] || '').trim();
+    const improve = String((summary.what_to_improve || [])[0] || '').trim();
+    const safe = String(summary.safe_adjustment_note || '').trim();
+    const parts = [headline, highlight, improve, safe].filter(Boolean);
+    const text = parts.join(' ').trim();
+    if (text) {
+      if (text === weeklyOpinionTarget) return;
+      setWeeklyOpinionTarget(text);
+      setWeeklyOpinionTyped(text);
     }
-    if (coachToneData?.response_text) {
-      setWeeklyOpinionTarget(coachToneData.response_text);
-      setWeeklyOpinionTyped(coachToneData.response_text);
-    }
-  }, [aiHistory, coachToneData?.response_text, weeklyOpinionTarget]);
+  }, [weeklySummary, weeklyOpinionTarget]);
 
   useEffect(() => {
     if (!weeklyOpinionTarget) return;
@@ -231,13 +265,15 @@ export function DashboardPage() {
                         className={`grid h-5 w-5 place-items-center rounded-full text-[10px] font-semibold ${
                           p.status === 'done'
                             ? 'bg-emerald-500/20 text-emerald-300'
+                            : p.status === 'partial_done'
+                              ? 'bg-amber-500/20 text-amber-300'
                             : p.status === 'missed'
                               ? 'bg-rose-500/20 text-rose-300'
                               : 'bg-slate-500/20 text-slate-200'
                         }`}
                         title={`${p.title || p.sport} (${p.status || 'planned'})`}
                       >
-                        {p.status === 'done' ? 'OK' : p.status === 'missed' ? 'X' : 'o'}
+                        {p.status === 'done' ? 'OK' : p.status === 'partial_done' ? '~' : p.status === 'missed' ? 'X' : 'o'}
                       </span>
                     ))}
                   </div>
@@ -247,6 +283,8 @@ export function DashboardPage() {
           })}
         </div>
       </Card>
+
+      {quickEncouragement?.encouragement ? <AiCallout title='AI Coach Note'>{quickEncouragement.encouragement}</AiCallout> : null}
 
 
       <div className='grid gap-4 md:grid-cols-2 lg:grid-cols-4'>
@@ -316,7 +354,7 @@ export function DashboardPage() {
       </div>
 
       <div className='grid gap-4 md:grid-cols-2'>
-        <Card className='h-[360px]'>
+        <Card className='flex h-[400px] min-h-0 flex-col overflow-hidden'>
           <CardTitle>Last Activity</CardTitle>
           <p className='mt-2 text-lg font-semibold'>{latest?.name || 'n/a'}</p>
           <div className='mt-3 grid gap-2 sm:grid-cols-4'>
@@ -337,9 +375,9 @@ export function DashboardPage() {
               <p className='text-sm font-semibold'>{latest?.avg_hr ? Math.round(latest.avg_hr) : 'n/a'}</p>
             </div>
           </div>
-          <div className='mt-3 h-[230px] overflow-hidden rounded-xl'>
+          <div className='mt-3 min-h-0 flex-1 overflow-hidden rounded-xl'>
             {routePoints.length > 1 ? (
-              <MapContainer center={routePoints[0]} zoom={12} style={{ height: '100%' }}>
+              <MapContainer center={routePoints[0]} zoom={12} style={{ height: '100%', width: '100%' }} className='h-full w-full overflow-hidden rounded-xl'>
                 <FitRouteBounds points={routePoints} />
                 <TileLayer url='https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png' />
                 <Polyline positions={routePoints} pathOptions={{ color: '#ef4444', weight: 4 }} />
@@ -352,16 +390,46 @@ export function DashboardPage() {
         <Card>
           <CardTitle>AI Weekly Progress</CardTitle>
           <div className='mt-3 space-y-3 text-sm'>
-            <div className='rounded-xl border border-border p-3 text-sm text-muted-foreground'>
+            <AiCallout title='' bodyClassName='text-base leading-relaxed'>
               {weeklyOpinionTarget ? (
-                <p className='text-sm text-cyan-100'>
+                <p className='text-base leading-relaxed text-cyan-100'>
                   {weeklyOpinionTyped}
                   {weeklyIsTyping ? <span className={`${weeklyCursorOn ? 'opacity-100' : 'opacity-0'} transition-opacity`}>|</span> : null}
                 </p>
               ) : (
                 'No AI weekly opinion generated yet.'
               )}
+            </AiCallout>
+            {weeklySummary?.can_generate ? (
+              <button
+                type='button'
+                onClick={() => generateWeeklyReview.mutate()}
+                disabled={generateWeeklyReview.isPending}
+                className='rounded-lg border border-cyan-400/40 bg-cyan-500/10 px-3 py-2 text-left text-sm text-cyan-100 transition hover:border-cyan-300'
+              >
+                {generateWeeklyReview.isPending ? 'Generating weekly review...' : (weeklySummary?.cta || 'Generate new weekly review')}
+              </button>
+            ) : (
+              <p className='text-xs text-muted-foreground'>{weeklySummary?.reason || ''}</p>
+            )}
+            <div className='pt-1'>
+              <button type='button' onClick={() => setShowPromptPanel((v) => !v)} className='text-xs text-cyan-300 hover:underline'>
+                {showPromptPanel ? 'Hide AI prompt/debug' : 'Show AI prompt/debug'}
+              </button>
             </div>
+            {showPromptPanel ? (
+              <div className='space-y-2 rounded-xl border border-cyan-400/30 bg-slate-950/60 p-3'>
+                <p className='text-xs uppercase tracking-wide text-cyan-200/80'>
+                  {weeklySummaryHistory?.[0]?.created_at ? `Latest weekly summary prompt (${new Date(weeklySummaryHistory[0].created_at).toLocaleString()})` : 'Latest weekly summary prompt'}
+                </p>
+                <div className='max-h-40 overflow-auto rounded-lg border border-border bg-black/30 p-2'>
+                  <p className='whitespace-pre-wrap text-[11px] text-slate-300'>{weeklySummaryHistory?.[0]?.prompt_system || 'No prompt_system available yet.'}</p>
+                </div>
+                <div className='max-h-40 overflow-auto rounded-lg border border-border bg-black/30 p-2'>
+                  <p className='whitespace-pre-wrap text-[11px] text-slate-300'>{weeklySummaryHistory?.[0]?.prompt_user || 'No prompt_user available yet.'}</p>
+                </div>
+              </div>
+            ) : null}
           </div>
         </Card>
       </div>
@@ -396,7 +464,7 @@ export function DashboardPage() {
                       <div className='mt-1 flex items-center gap-1'>
                         {planned.slice(0, 2).map((p, idx) => (
                           <span key={idx} className='text-[10px] text-muted-foreground'>
-                            {p.status === 'done' ? 'OK' : p.status === 'missed' ? 'X' : 'o'} {p.sport}
+                            {p.status === 'done' ? 'OK' : p.status === 'partial_done' ? '~' : p.status === 'missed' ? 'X' : 'o'} {p.sport}
                           </span>
                         ))}
                       </div>
@@ -435,7 +503,8 @@ export function DashboardPage() {
                     </div>
                   ))}
                 {selectedDate &&
-                  (data || []).filter((a) => new Date(a.start_date).toISOString().slice(0, 10) === selectedDate.toISOString().slice(0, 10)).length === 0 && (
+                  (data || []).filter((a) => new Date(a.start_date).toISOString().slice(0, 10) === selectedDate.toISOString().slice(0, 10)).length === 0 &&
+                  ((weekPlan?.days || []).filter((p) => p.date === selectedDate.toISOString().slice(0, 10))).length === 0 && (
                     <p className='text-muted-foreground'>No workouts on this day.</p>
                   )}
               </div>

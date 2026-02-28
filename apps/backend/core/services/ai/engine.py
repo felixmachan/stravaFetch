@@ -8,6 +8,7 @@ from django.contrib.auth.models import User
 from django.utils import timezone
 
 from core.models import AIInteraction, Activity, AthleteProfile, CoachNote, TrainingPlan
+from core.services.planned_workouts import replace_week_plan_rows
 
 from .client import OpenAIResponsesClient
 from .context import (
@@ -141,6 +142,9 @@ def _plan_locked_encouragement_text(training_plan_json: dict[str, Any], weekly_s
     planned = int(training_plan_json.get("planned_session_count") or 0)
     completed = int(training_plan_json.get("completed_session_count") or 0)
     done_distance = float(weekly_stats_json.get("distance_km") or 0.0)
+    total = completed + planned
+    if total <= 0:
+        return f"No planned sessions remain for this week. Current completed distance is {done_distance:.1f} km."
     first = f"You have completed {completed} of {completed + planned} planned sessions this week."
     second = (
         f"Keep the remaining sessions consistent and easy where planned; current completed distance is {done_distance:.1f} km."
@@ -248,12 +252,18 @@ def _call_json(
     return parsed, response, interaction
 
 
-def generate_weekly_plan(user: User, force: bool = False, *, bootstrap_last_n: int | None = None) -> dict[str, Any]:
+def generate_weekly_plan(
+    user: User,
+    force: bool = False,
+    *,
+    bootstrap_last_n: int | None = None,
+    target_week_start: dt.date | None = None,
+) -> dict[str, Any]:
     ctx = _build_context(user, bootstrap_last_n=bootstrap_last_n)
     if not ctx["ai_settings"]["feature_flags"]["weekly_plan"]:
         return {"plan": {}, "skipped": True, "source": "feature_disabled"}
 
-    next_week = _week_start() + dt.timedelta(days=7)
+    next_week = target_week_start or (_week_start() + dt.timedelta(days=7))
     input_payload = {
         "profile": ctx["profile_json"],
         "goal": ctx["goal_json"],
@@ -338,6 +348,10 @@ def generate_weekly_plan(user: User, force: bool = False, *, bootstrap_last_n: i
                 "main_set": d.get("main_set", ""),
             }
         )
+    # For current-week generations, keep only future sessions (from tomorrow).
+    if next_week == _week_start():
+        cutoff = timezone.localdate() + dt.timedelta(days=1)
+        old_days = [d for d in old_days if str(d.get("date") or "") >= cutoff.isoformat()]
 
     plan_json = {
         "week_start": parsed.get("week_start_date", next_week.isoformat()),
@@ -355,6 +369,14 @@ def generate_weekly_plan(user: User, force: bool = False, *, bootstrap_last_n: i
         start_date=next_week,
         end_date=next_week + dt.timedelta(days=6),
         defaults={"plan_json": plan_json},
+    )
+    replace_week_plan_rows(
+        user,
+        week_start=tp.start_date,
+        week_end=tp.end_date,
+        days=old_days,
+        training_plan=tp,
+        source="ai_weekly_plan",
     )
     return {"plan": tp.plan_json, "interaction_id": interaction.id if interaction else None, "source": response.source, "skipped": False}
 
@@ -433,15 +455,26 @@ def generate_weekly_summary(user: User) -> dict[str, Any]:
         "athlete_state": ctx["athlete_state_json"],
         "training_plan": ctx["training_plan_json"],
     }
+    goal_event_date_raw = str((ctx["goal_json"] or {}).get("event_date") or "").strip()
+    days_to_goal = None
+    if goal_event_date_raw:
+        try:
+            goal_date = dt.date.fromisoformat(goal_event_date_raw)
+            days_to_goal = (goal_date - timezone.localdate()).days
+        except Exception:
+            days_to_goal = None
     input_hash = json_hash(input_payload)
 
     def _build():
         system_prompt = (
             SHARED_SYSTEM_POLICY
             + " Return strict JSON weekly summary. headline max 8 words, highlights max 4 bullets. "
-            + "training_plan_json is source of truth for planned sessions and dates; do not invent extra sessions or dates."
+            + "training_plan_json is source of truth for planned sessions and dates; do not invent extra sessions or dates. "
+            + "You must reason from goal_json and event timing, and explicitly align guidance to the stated goal trajectory."
         )
         user_prompt = weekly_summary_user_prompt(weekly, ctx["goal_json"], ctx["athlete_state_json"], ctx["training_plan_json"])
+        if days_to_goal is not None:
+            user_prompt += f" goal_timing_days_to_event={days_to_goal}"
         parsed, response, _ = _call_json(
             feature="weekly_summary",
             user=user,
@@ -480,7 +513,10 @@ def generate_weekly_summary(user: User) -> dict[str, Any]:
             mini = addendum_client.complete_text(
                 model="gpt-5-mini",
                 system_prompt=SHARED_SYSTEM_POLICY + " Write one safe adjustment sentence only.",
-                user_prompt=f"risk_flags={payload.get('risk_flags')} readiness={ctx['athlete_state_json'].get('readiness_hint')}",
+                user_prompt=(
+                    f"risk_flags={payload.get('risk_flags')} readiness={ctx['athlete_state_json'].get('readiness_hint')} "
+                    f"goal_json={ctx['goal_json']} weekly_stats_json={weekly} days_to_goal={days_to_goal}"
+                ),
                 temperature=0.1,
             )
             payload["safe_adjustment_note"] = _cap_sentences(mini.text or "Reduce intensity and prioritize recovery next 48 hours.", 1)

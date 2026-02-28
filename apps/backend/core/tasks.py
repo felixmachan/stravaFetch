@@ -23,19 +23,49 @@ def poll_strava_activities():
 
 
 @shared_task
-def generate_weekly_plan_sunday():
-    # Runs from beat schedule; creates/refreshes next week plans for opted-in users.
+def generate_weekly_plan_scheduler():
+    # Runs hourly from beat; users control day/hour in schedule.plan_generation.
+    now = timezone.localtime()
+    weekday_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    next_week_start = (timezone.localdate() - dt.timedelta(days=timezone.localdate().weekday())) + dt.timedelta(days=7)
+    next_week_key = next_week_start.isoformat()
     for profile in AthleteProfile.objects.select_related("user").all():
         schedule = profile.schedule or {}
         ai_settings = schedule.get("ai_settings") or {}
         if ai_settings.get("weekly_plan_enabled", True):
-            generate_weekly_plan_task.delay(profile.user_id, False)
+            cfg = (schedule.get("plan_generation") or {}) if isinstance(schedule, dict) else {}
+            day = str(cfg.get("day") or "sun").strip().lower()[:3]
+            hour = int(cfg.get("hour") or 2)
+            if day not in {"sat", "sun"}:
+                day = "sun"
+            hour = max(0, min(23, hour))
+            if now.weekday() != weekday_map[day] or now.hour != hour:
+                continue
+            if str(cfg.get("last_auto_generated_week_start") or "") == next_week_key:
+                continue
+            generate_weekly_plan_task.delay(profile.user_id, False, next_week_key)
+            cfg["last_auto_generated_week_start"] = next_week_key
+            schedule["plan_generation"] = cfg
+            profile.schedule = schedule
+            profile.save(update_fields=["schedule"])
 
 
 @shared_task
-def generate_weekly_plan_task(user_id, force=False):
+def generate_weekly_plan_sunday():
+    # Backward-compatible task name.
+    return generate_weekly_plan_scheduler()
+
+
+@shared_task
+def generate_weekly_plan_task(user_id, force=False, target_week_start_iso=None):
     user = User.objects.get(id=user_id)
-    return generate_weekly_plan_service(user, force=bool(force))
+    target_week_start = None
+    if target_week_start_iso:
+        try:
+            target_week_start = dt.date.fromisoformat(str(target_week_start_iso))
+        except Exception:
+            target_week_start = None
+    return generate_weekly_plan_service(user, force=bool(force), target_week_start=target_week_start)
 
 
 @shared_task
@@ -91,84 +121,93 @@ def sync_now_for_user(user_id):
         sync_athlete_profile_from_connection(user, conn, force=False)
     except Exception:
         pass
-    # Always perform full history sync from Strava.
-    after = 0
+    # On onboarding, sync at most the latest 30 activities.
 
     fetched = 0
     upserted = 0
     new_activities = 0
-    reaction_cutoff = timezone.now() - dt.timedelta(days=10)
-    page = 1
-    per_page = 100
-    while True:
+    max_activities = 30
+    sync_failed = False
+    sync_error = ""
+    synced_strava_ids = []
+    try:
         r = requests.get(
             'https://www.strava.com/api/v3/athlete/activities',
             headers={'Authorization': f'Bearer {token}'},
-            params={'after': after, 'per_page': per_page, 'page': page},
+            params={'per_page': max_activities, 'page': 1},
             timeout=30,
         )
         if r.status_code == 429:
-            return {'rate_limited': True, 'fetched': fetched, 'upserted': upserted}
-        r.raise_for_status()
-        items = r.json()
-        if not items:
-            break
+            sync_failed = True
+            sync_error = "strava_rate_limited"
+        else:
+            r.raise_for_status()
+            items = r.json() or []
+            # Defensive sort to ensure newest-first ordering.
+            items = sorted(items, key=lambda x: str(x.get('start_date') or ''), reverse=True)[:max_activities]
+            fetched = len(items)
+            for a in items:
+                obj, created = Activity.objects.update_or_create(strava_activity_id=a['id'], defaults={
+                    'user': user, 'type': a.get('type', 'Other'), 'name': a.get('name', 'Activity'),
+                    'start_date': a['start_date'], 'distance_m': a.get('distance', 0), 'moving_time_s': a.get('moving_time', 0),
+                    'elapsed_time_s': a.get('elapsed_time', 0), 'total_elevation_gain_m': a.get('total_elevation_gain', 0),
+                    'average_speed_mps': a.get('average_speed', 0), 'max_speed_mps': a.get('max_speed', 0),
+                    'avg_hr': a.get('average_heartrate'), 'max_hr': a.get('max_heartrate'), 'calories': a.get('calories'),
+                    'suffer_score': a.get('suffer_score'), 'map_summary_polyline': a.get('map', {}).get('summary_polyline'),
+                    'raw_payload': a, 'is_deleted': False,
+                })
+                synced_strava_ids.append(int(a['id']))
+                try:
+                    sync_streams_for_activity(user, obj, token)
+                except Exception:
+                    # Keep activity row even if stream sync fails.
+                    pass
+                upserted += 1
+                if created:
+                    new_activities += 1
+    except Exception as exc:
+        sync_failed = True
+        sync_error = str(exc)[:250]
 
-        fetched += len(items)
-        for a in items:
-            obj, created = Activity.objects.update_or_create(strava_activity_id=a['id'], defaults={
-                'user': user, 'type': a.get('type', 'Other'), 'name': a.get('name', 'Activity'),
-                'start_date': a['start_date'], 'distance_m': a.get('distance', 0), 'moving_time_s': a.get('moving_time', 0),
-                'elapsed_time_s': a.get('elapsed_time', 0), 'total_elevation_gain_m': a.get('total_elevation_gain', 0),
-                'average_speed_mps': a.get('average_speed', 0), 'max_speed_mps': a.get('max_speed', 0),
-                'avg_hr': a.get('average_heartrate'), 'max_hr': a.get('max_heartrate'), 'calories': a.get('calories'),
-                'suffer_score': a.get('suffer_score'), 'map_summary_polyline': a.get('map', {}).get('summary_polyline'), 'raw_payload': a,
-            })
-            sync_streams_for_activity(user, obj, token)
-            upserted += 1
-            if created:
-                new_activities += 1
-                if obj.start_date >= reaction_cutoff:
-                    generate_activity_reaction_task.delay(obj.id, user.id)
-
-        if len(items) < per_page:
-            break
-        page += 1
+    if not sync_failed and synced_strava_ids:
+        # Keep only the latest synced set visible for this user.
+        Activity.objects.filter(user=user, is_deleted=False).exclude(strava_activity_id__in=synced_strava_ids).update(is_deleted=True)
 
     conn.last_sync_at = timezone.now()
     conn.last_polled_at = timezone.now()
     conn.save(update_fields=['last_sync_at', 'last_polled_at'])
 
-    # Ensure onboarding-required latest 10 activities are covered by AI reactions,
-    # not only newly created rows.
-    recent_ids = list(
-        Activity.objects.filter(user=user, is_deleted=False).order_by("-start_date").values_list("id", flat=True)[:10]
-    )
-    noted_ids = set(
-        CoachNote.objects.filter(activity_id__in=recent_ids).values_list("activity_id", flat=True).distinct()
-    ) if recent_ids else set()
-    for aid in recent_ids:
-        if aid not in noted_ids:
-            generate_activity_reaction_task.delay(aid, user.id)
+    # Activity AI reactions are generated manually per workout (one-time).
 
     profile, _ = AthleteProfile.objects.get_or_create(user=user)
     schedule = profile.schedule or {}
     onboarding = schedule.get("onboarding", {})
     onboarding["sync_in_progress"] = False
-    onboarding["full_sync_complete"] = True
+    onboarding["full_sync_complete"] = not sync_failed
     onboarding["last_full_sync_at"] = timezone.now().isoformat()
     onboarding["last_sync_result"] = {
         "fetched": fetched,
         "upserted": upserted,
         "new_activities": new_activities,
+        "max_activities": max_activities,
+        "failed": sync_failed,
+        "error": sync_error,
     }
     schedule["onboarding"] = onboarding
     profile.schedule = schedule
     profile.save(update_fields=["schedule"])
-    if new_activities > 0:
+    if not sync_failed:
         generate_coach_tone_task.delay(user.id)
         refresh_weekly_artifacts_task.delay(user.id)
-    return {'rate_limited': False, 'fetched': fetched, 'upserted': upserted, 'new_activities': new_activities}
+    return {
+        'rate_limited': sync_error == "strava_rate_limited",
+        'fetched': fetched,
+        'upserted': upserted,
+        'new_activities': new_activities,
+        'failed': sync_failed,
+        'error': sync_error,
+        'max_activities': max_activities,
+    }
 
 
 def _hr_zones(heartrate, hr_zones=None):

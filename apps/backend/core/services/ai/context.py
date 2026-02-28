@@ -9,7 +9,8 @@ from django.contrib.auth.models import User
 from django.db.models import Avg
 from django.utils import timezone
 
-from core.models import AIFeatureCache, Activity, AthleteProfile, TrainingPlan
+from core.models import AIFeatureCache, Activity, AthleteProfile, PlannedWorkout, TrainingPlan
+from core.services.planned_workouts import ensure_week_rows_from_training_plan
 
 
 def get_ai_settings(profile: AthleteProfile) -> dict[str, Any]:
@@ -296,25 +297,26 @@ def current_week_plan_json(user: User) -> dict[str, Any]:
         .order_by("-start_date")
         .first()
     )
-    days = list((tp.plan_json or {}).get("days") or []) if tp else []
-    compact_days = []
-    for d in days:
-        if not isinstance(d, dict):
-            continue
-        compact_days.append(
-            {
-                "date": d.get("date"),
-                "sport": d.get("sport"),
-                "title": d.get("title"),
-                "status": d.get("status") or "planned",
-            }
-        )
+    if tp:
+        ensure_week_rows_from_training_plan(user, tp)
+    rows = list(
+        PlannedWorkout.objects.filter(user=user, week_start=week_start, week_end=week_end).order_by("planned_date", "sort_order", "id")
+    )
+    compact_days = [
+        {
+            "date": row.planned_date.isoformat(),
+            "sport": row.sport,
+            "title": row.title,
+            "status": row.status or "planned",
+        }
+        for row in rows
+    ]
     planned_count = len([d for d in compact_days if d.get("status") == "planned"])
-    done_count = len([d for d in compact_days if d.get("status") == "done"])
+    done_count = len([d for d in compact_days if d.get("status") in {"done", "partial_done"}])
     return {
         "week_start": week_start.isoformat(),
         "week_end": week_end.isoformat(),
-        "has_plan": bool(tp),
+        "has_plan": bool(tp or rows),
         "planned_session_count": planned_count,
         "completed_session_count": done_count,
         "days": compact_days,

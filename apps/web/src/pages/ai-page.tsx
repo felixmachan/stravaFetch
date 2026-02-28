@@ -4,6 +4,7 @@ import { MessageSquare, Sparkles } from '../components/ui/icons';
 import { api } from '../lib/api';
 import { Card } from '../components/ui/card';
 import { Button } from '../components/ui/button';
+import { AiCallout } from '../components/ui/ai-callout';
 
 const presetQuestions = [
   'What should be my key session in the next 48 hours?',
@@ -76,14 +77,14 @@ export function AiPage() {
           </div>
         </div>
         {answer ? (
-          <div className='mt-4 rounded-xl border border-cyan-400/40 bg-cyan-500/10 p-3 text-sm text-cyan-100'>
+          <AiCallout className='mt-4' title='AI Response'>
             {source && (
               <p className='mb-2 text-xs uppercase tracking-wide text-cyan-200/80'>
                 source: {source}
               </p>
             )}
             {answer}
-          </div>
+          </AiCallout>
         ) : null}
 
         <div className='mt-4 rounded-xl border border-border p-3'>
@@ -96,7 +97,9 @@ export function AiPage() {
                 <div key={row.id} className='rounded-lg border border-border bg-muted/20 p-3'>
                   <p className='text-xs text-muted-foreground'>{new Date(row.created_at).toLocaleString()} | {row.source}</p>
                   <p className='mt-1 text-sm font-medium'>{row.question || 'Question unavailable'}</p>
-                  <p className='mt-1 text-sm text-muted-foreground'>{row.response_text}</p>
+                  <AiCallout className='mt-2' title='AI Response' bodyClassName='text-sm'>
+                    {row.response_text}
+                  </AiCallout>
                 </div>
               ))
             )}

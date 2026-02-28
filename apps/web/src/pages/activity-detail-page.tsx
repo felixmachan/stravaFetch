@@ -11,13 +11,25 @@ import { decodePolyline } from '../lib/polyline';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Card } from '../components/ui/card';
+import { AiCallout } from '../components/ui/ai-callout';
 
 function FitRouteBounds({ points }: { points: [number, number][] }) {
   const map = useMap();
-  if (points.length > 1) {
+  useEffect(() => {
+    if (points.length <= 1) return;
     const bounds = new LatLngBounds(points);
-    map.fitBounds(bounds, { padding: [40, 40], maxZoom: 16 });
-  }
+    const applyFit = () => {
+      map.invalidateSize();
+      map.fitBounds(bounds, { padding: [24, 24], maxZoom: 17 });
+    };
+    applyFit();
+    const t1 = window.setTimeout(applyFit, 120);
+    const t2 = window.setTimeout(applyFit, 420);
+    return () => {
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+    };
+  }, [map, points]);
   return null;
 }
 
@@ -39,6 +51,14 @@ function formatClock(seconds = 0) {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function formatPaceTick(secPerKm = 0) {
+  if (!secPerKm) return 'n/a';
+  const s = Math.max(0, Math.round(secPerKm));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${String(r).padStart(2, '0')}`;
 }
 
 function MetricTooltip({ active, payload }: any) {
@@ -66,6 +86,18 @@ function ZoneTooltip({ active, payload, label }: any) {
   );
 }
 
+function PaceTooltip({ active, payload }: any) {
+  if (!active || !payload?.length) return null;
+  const point = payload[0].payload || {};
+  return (
+    <div className='rounded-xl border border-slate-600/50 bg-slate-950/95 px-3 py-2 text-xs text-slate-100 shadow-xl'>
+      <p className='font-semibold text-slate-200'>{formatClock(Number(point.t || 0))}</p>
+      <p className='text-slate-300'>{Number(point.x || 0).toFixed(2)} km</p>
+      <p className='mt-1'>Pace: <span className='font-semibold'>{formatPace(Number(point.pace || 0))}</span></p>
+    </div>
+  );
+}
+
 export function ActivityDetailPage() {
   const params = useParams();
   const id = params.id;
@@ -79,6 +111,17 @@ export function ActivityDetailPage() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['activity', id] });
       qc.invalidateQueries({ queryKey: ['activities'] });
+    },
+  });
+  const generateReaction = useMutation({
+    mutationFn: async () => (await api.post(`/activities/${id}/regenerate-note`)).data,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['activity', id] });
+      window.dispatchEvent(new CustomEvent('app:toast', { detail: { title: 'AI reaction requested', message: 'It can be generated once per workout.' } }));
+    },
+    onError: (err: any) => {
+      window.dispatchEvent(new CustomEvent('app:toast', { detail: { title: 'AI reaction', message: err?.response?.data?.detail || 'Could not generate reaction.' } }));
+      qc.invalidateQueries({ queryKey: ['activity', id] });
     },
   });
 
@@ -107,6 +150,62 @@ export function ActivityDetailPage() {
   const hasHrData = chartData.some((d) => d.hr != null);
   const hasAltData = chartData.some((d) => d.alt != null);
   const isSwim = String(data?.type || '').toLowerCase().includes('swim');
+  const paceSeries = useMemo(() => {
+    const distance = (data?.streams?.distance || []) as number[];
+    const time = (data?.streams?.time || []) as number[];
+    const len = Math.min(distance.length, time.length);
+    if (len < 3) return [] as Array<{ x: number; t: number; pace: number }>;
+    const bucketSec = 10;
+    const bucketed: Array<{ x: number; t: number; pace: number }> = [];
+    let startIdx = 0;
+
+    for (let i = 1; i < len; i += 1) {
+      const elapsed = Number(time[i] || 0) - Number(time[startIdx] || 0);
+      if (elapsed < bucketSec) continue;
+      const dDelta = Number(distance[i] || 0) - Number(distance[startIdx] || 0);
+      const tDelta = elapsed;
+      const x = Number((Number(distance[i] || 0) / 1000).toFixed(2));
+      const t = Number(time[i] || 0);
+      if (dDelta > 5 && tDelta > 0) {
+        const pace = tDelta / (dDelta / 1000);
+        if (Number.isFinite(pace) && pace >= 120 && pace <= 1200) {
+          bucketed.push({ x, t, pace });
+        }
+      }
+      startIdx = i;
+    }
+
+    const smoothWindow = 1;
+    return bucketed.map((point, idx) => {
+      const start = Math.max(0, idx - smoothWindow);
+      const end = Math.min(bucketed.length - 1, idx + smoothWindow);
+      let sum = 0;
+      let count = 0;
+      for (let j = start; j <= end; j += 1) {
+        sum += bucketed[j].pace;
+        count += 1;
+      }
+      return { x: point.x, t: point.t, pace: Number((sum / Math.max(1, count)).toFixed(1)) };
+    });
+  }, [data]);
+  const hasPaceData = paceSeries.length > 0;
+  const paceDomain = useMemo<[number, number]>(() => {
+    const p = paceSeries.map((x) => x.pace).filter((x) => Number.isFinite(x));
+    if (!p.length) return [240, 480];
+    const minP = Math.min(...p);
+    const maxP = Math.max(...p);
+    const pad = Math.max(10, (maxP - minP) * 0.12);
+    return [Math.max(120, Math.floor(minP - pad)), Math.min(1200, Math.ceil(maxP + pad))];
+  }, [paceSeries]);
+  const paceChartData = useMemo(
+    () =>
+      paceSeries.map((pt) => ({
+        ...pt,
+        pace_plot: paceDomain[1] - pt.pace + paceDomain[0],
+      })),
+    [paceSeries, paceDomain]
+  );
+  const paceTickFromPlot = (v: number) => paceDomain[1] - Number(v) + paceDomain[0];
 
   const splits = useMemo(() => {
     const rawSplits = data?.raw_payload?.splits_metric || [];
@@ -176,6 +275,21 @@ export function ActivityDetailPage() {
         </div>
       </Card>
 
+      <div>
+        {quickAi ? (
+          <AiCallout title='AI Coach Note'>
+            {quickAi}
+          </AiCallout>
+        ) : (
+          <div className='space-y-2 rounded-xl border border-border bg-muted/20 px-3 py-3 text-sm text-muted-foreground'>
+            <p>No AI reaction generated for this workout yet.</p>
+            <Button variant='outline' onClick={() => generateReaction.mutate()} disabled={generateReaction.isPending}>
+              {generateReaction.isPending ? 'Generating...' : 'Generate AI reaction (one-time)'}
+            </Button>
+          </div>
+        )}
+      </div>
+
       {!isSwim && (
         <Card className='h-[420px] overflow-hidden p-3'>
           {routePoints.length > 1 ? (
@@ -200,7 +314,7 @@ export function ActivityDetailPage() {
           )}
         </Card>
       )}
-      {(!hasHrData || (!isSwim && !hasAltData) || splits.length === 0) && (
+      {(!hasHrData || (!isSwim && (!hasAltData || !hasPaceData)) || splits.length === 0) && (
         <Card className='p-4'>
           <p className='text-sm text-muted-foreground'>Some stream data is still missing for this activity.</p>
           <Button className='mt-2' variant='outline' onClick={() => syncNow.mutate()} disabled={syncNow.isPending}>
@@ -209,32 +323,32 @@ export function ActivityDetailPage() {
         </Card>
       )}
 
-      <div className='grid gap-4 md:grid-cols-2'>
-        <Card className='h-72 p-4'>
-          <p className='text-base font-semibold'>Heart Rate</p>
-          <div className='mt-3 h-[220px] rounded-xl'>
-            {hasHrData ? (
-              <ResponsiveContainer width='100%' height='100%'>
-                <AreaChart data={chartData}>
-                  <defs>
-                    <linearGradient id='hrGradient' x1='0' y1='0' x2='0' y2='1'>
-                      <stop offset='0%' stopColor='#fb7185' stopOpacity={0.65} />
-                      <stop offset='100%' stopColor='#fb7185' stopOpacity={0.05} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray='4 4' stroke='hsl(var(--border))' />
-                  <XAxis dataKey='x' />
-                  <YAxis />
-                  <ChartTooltip content={<MetricTooltip />} />
-                  <Area type='monotone' dataKey='hr' stroke='#fb7185' fill='url(#hrGradient)' strokeWidth={2.2} />
-                </AreaChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className='grid h-full place-items-center text-sm text-muted-foreground'>No heart-rate stream yet.</div>
-            )}
-          </div>
-        </Card>
-        {isSwim ? (
+      {isSwim ? (
+        <div className='grid gap-4 md:grid-cols-2'>
+          <Card className='h-72 p-4'>
+            <p className='text-base font-semibold'>Heart Rate</p>
+            <div className='mt-3 h-[220px] rounded-xl'>
+              {hasHrData ? (
+                <ResponsiveContainer width='100%' height='100%'>
+                  <AreaChart data={chartData}>
+                    <defs>
+                      <linearGradient id='hrGradient' x1='0' y1='0' x2='0' y2='1'>
+                        <stop offset='0%' stopColor='#fb7185' stopOpacity={0.65} />
+                        <stop offset='100%' stopColor='#fb7185' stopOpacity={0.05} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray='4 4' stroke='hsl(var(--border))' />
+                    <XAxis dataKey='t' tickFormatter={(v) => formatClock(Number(v))} minTickGap={28} />
+                    <YAxis />
+                    <ChartTooltip content={<MetricTooltip />} />
+                    <Area type='monotone' dataKey='hr' stroke='#fb7185' fill='url(#hrGradient)' strokeWidth={2.2} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className='grid h-full place-items-center text-sm text-muted-foreground'>No heart-rate stream yet.</div>
+              )}
+            </div>
+          </Card>
           <Card className='h-72 p-4'>
             <p className='text-base font-semibold'><Waves className='mr-1 inline h-4 w-4 text-cyan-300' />Swim Metrics</p>
             <div className='mt-4 grid grid-cols-2 gap-4'>
@@ -248,33 +362,86 @@ export function ActivityDetailPage() {
               </div>
             </div>
           </Card>
-        ) : (
+        </div>
+      ) : (
+        <>
+          <div className='grid gap-4 md:grid-cols-2'>
+            <Card className='h-72 p-4'>
+              <p className='text-base font-semibold'>Heart Rate</p>
+              <div className='mt-3 h-[220px] rounded-xl'>
+                {hasHrData ? (
+                  <ResponsiveContainer width='100%' height='100%'>
+                    <AreaChart data={chartData}>
+                      <defs>
+                        <linearGradient id='hrGradient' x1='0' y1='0' x2='0' y2='1'>
+                          <stop offset='0%' stopColor='#fb7185' stopOpacity={0.65} />
+                          <stop offset='100%' stopColor='#fb7185' stopOpacity={0.05} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray='4 4' stroke='hsl(var(--border))' />
+                      <XAxis dataKey='t' tickFormatter={(v) => formatClock(Number(v))} minTickGap={28} />
+                      <YAxis />
+                      <ChartTooltip content={<MetricTooltip />} />
+                      <Area type='monotone' dataKey='hr' stroke='#fb7185' fill='url(#hrGradient)' strokeWidth={2.2} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className='grid h-full place-items-center text-sm text-muted-foreground'>No heart-rate stream yet.</div>
+                )}
+              </div>
+            </Card>
+            <Card className='h-72 p-4'>
+              <p className='text-base font-semibold'>Elevation</p>
+              <div className='mt-3 h-[220px] rounded-xl'>
+                {hasAltData ? (
+                  <ResponsiveContainer width='100%' height='100%'>
+                    <AreaChart data={chartData}>
+                      <defs>
+                        <linearGradient id='altGradient' x1='0' y1='0' x2='0' y2='1'>
+                          <stop offset='0%' stopColor='#38bdf8' stopOpacity={0.45} />
+                          <stop offset='100%' stopColor='#38bdf8' stopOpacity={0.04} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray='4 4' stroke='hsl(var(--border))' />
+                      <XAxis dataKey='t' tickFormatter={(v) => formatClock(Number(v))} minTickGap={28} />
+                      <YAxis />
+                      <ChartTooltip content={<MetricTooltip />} />
+                      <Area type='monotone' dataKey='alt' stroke='#38bdf8' dot={false} strokeWidth={2.4} fill='url(#altGradient)' />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className='grid h-full place-items-center text-sm text-muted-foreground'>No elevation stream yet.</div>
+                )}
+              </div>
+            </Card>
+          </div>
+
           <Card className='h-72 p-4'>
-            <p className='text-base font-semibold'>Elevation</p>
+            <p className='text-base font-semibold'>Pace Trend</p>
             <div className='mt-3 h-[220px] rounded-xl'>
-              {hasAltData ? (
+              {hasPaceData ? (
                 <ResponsiveContainer width='100%' height='100%'>
-                  <AreaChart data={chartData}>
+                  <AreaChart data={paceChartData}>
                     <defs>
-                      <linearGradient id='altGradient' x1='0' y1='0' x2='0' y2='1'>
-                        <stop offset='0%' stopColor='#38bdf8' stopOpacity={0.45} />
-                        <stop offset='100%' stopColor='#38bdf8' stopOpacity={0.04} />
+                      <linearGradient id='paceGradient' x1='0' y1='0' x2='0' y2='1'>
+                        <stop offset='0%' stopColor='#22d3ee' stopOpacity={0.42} />
+                        <stop offset='100%' stopColor='#22d3ee' stopOpacity={0.06} />
                       </linearGradient>
                     </defs>
                     <CartesianGrid strokeDasharray='4 4' stroke='hsl(var(--border))' />
-                    <XAxis dataKey='x' />
-                    <YAxis />
-                    <ChartTooltip content={<MetricTooltip />} />
-                    <Area type='monotone' dataKey='alt' stroke='#38bdf8' dot={false} strokeWidth={2.4} fill='url(#altGradient)' />
+                    <XAxis dataKey='t' tickFormatter={(v) => formatClock(Number(v))} minTickGap={28} />
+                    <YAxis domain={paceDomain} tickFormatter={(v) => formatPaceTick(paceTickFromPlot(Number(v)))} />
+                    <ChartTooltip content={<PaceTooltip />} />
+                    <Area type='monotone' dataKey='pace_plot' stroke='#22d3ee' dot={false} strokeWidth={2.2} fill='url(#paceGradient)' />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : (
-                <div className='grid h-full place-items-center text-sm text-muted-foreground'>No elevation stream yet.</div>
+                <div className='grid h-full place-items-center text-sm text-muted-foreground'>No pace stream yet.</div>
               )}
             </div>
           </Card>
-        )}
-      </div>
+        </>
+      )}
 
       <div className='grid gap-4 md:grid-cols-2'>
         <Card className='p-4'>
@@ -311,12 +478,6 @@ export function ActivityDetailPage() {
               </BarChart>
             </ResponsiveContainer>
           </div>
-        </Card>
-
-        <Card className='p-4'>
-          <p className='text-base font-semibold'>AI Coach Note</p>
-          {quickAi ? <p className='mt-2 rounded-xl border border-cyan-400/40 bg-cyan-500/10 px-3 py-2 text-sm text-cyan-100'>{quickAi}</p> : null}
-          {!quickAi ? <p className='mt-2 rounded-xl border border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground'>Reaction is being generated automatically after sync...</p> : null}
         </Card>
       </div>
     </div>

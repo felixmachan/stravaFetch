@@ -100,9 +100,9 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'core.tasks.poll_strava_activities',
         'schedule': int(os.getenv('STRAVA_POLL_INTERVAL_MINUTES', '15')) * 60,
     },
-    'weekly-plan-sunday': {
-        'task': 'core.tasks.generate_weekly_plan_sunday',
-        'schedule': crontab(minute=0, hour=2, day_of_week='sun'),
+    'weekly-plan-scheduler': {
+        'task': 'core.tasks.generate_weekly_plan_scheduler',
+        'schedule': crontab(minute=0),
     },
 }
 

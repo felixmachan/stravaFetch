@@ -31,6 +31,7 @@ urlpatterns = [
     path('ai/onboarding/generate', views.ai_onboarding_generate),
     path('ai/history', views.ai_history),
     path('ai/weekly-summary', views.ai_weekly_summary),
+    path('ai/weekly-summary/generate', views.ai_weekly_summary_generate),
     path('ai/quick-encouragement', views.ai_quick_encouragement),
     path('ai/ask', views.ai_ask),
     path('coach-tone', views.coach_tone_view),

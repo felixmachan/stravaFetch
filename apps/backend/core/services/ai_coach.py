@@ -190,8 +190,14 @@ def refresh_week_plan_status(user: User, plan: TrainingPlan | None = None) -> Tr
     return tp
 
 
-def generate_weekly_plan(user: User, force: bool = False, *, bootstrap_last_n: int | None = None) -> dict[str, Any]:
-    result = generate_weekly_plan_v3(user, force=force, bootstrap_last_n=bootstrap_last_n)
+def generate_weekly_plan(
+    user: User,
+    force: bool = False,
+    *,
+    bootstrap_last_n: int | None = None,
+    target_week_start: dt.date | None = None,
+) -> dict[str, Any]:
+    result = generate_weekly_plan_v3(user, force=force, bootstrap_last_n=bootstrap_last_n, target_week_start=target_week_start)
     start_raw = result.get("plan", {}).get("week_start", _week_start_monday().isoformat())
     try:
         start_date = dt.date.fromisoformat(str(start_raw))

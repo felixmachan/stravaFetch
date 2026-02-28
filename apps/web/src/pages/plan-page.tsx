@@ -8,6 +8,7 @@ import { Card } from '../components/ui/card';
 import { Input } from '../components/ui/input';
 import { Progress } from '../components/ui/progress';
 import { Button } from '../components/ui/button';
+import { AiCallout } from '../components/ui/ai-callout';
 
 type GoalPayload = {
   type: 'race' | 'time_trial' | 'annual_km';
@@ -22,6 +23,9 @@ type GoalPayload = {
   weekly_activity_goal_run?: number;
   weekly_activity_goal_swim?: number;
   weekly_activity_goal_ride?: number;
+  training_days?: string[];
+  weekly_plan_generation_day?: 'sat' | 'sun' | string;
+  weekly_plan_generation_hour?: number;
   notes?: string;
 };
 
@@ -34,7 +38,7 @@ type PlannedSession = {
   title?: string;
   workout_type?: string;
   coach_notes?: string;
-  status?: 'planned' | 'done' | 'missed';
+  status?: 'planned' | 'done' | 'partial_done' | 'missed';
 };
 
 type WeekPlan = {
@@ -52,6 +56,15 @@ const DAY_LABELS: Record<string, string> = {
   sat: 'Saturday',
   sun: 'Sunday',
 };
+const TRAINING_DAYS = [
+  { key: 'mon', label: 'Mon' },
+  { key: 'tue', label: 'Tue' },
+  { key: 'wed', label: 'Wed' },
+  { key: 'thu', label: 'Thu' },
+  { key: 'fri', label: 'Fri' },
+  { key: 'sat', label: 'Sat' },
+  { key: 'sun', label: 'Sun' },
+] as const;
 
 function formatDays(days: string[]) {
   if (!days.length) return 'Not set';
@@ -98,11 +111,42 @@ export function PlanPage() {
   const [aiTargetText, setAiTargetText] = useState('');
   const [aiTypedText, setAiTypedText] = useState('');
   const [aiCursorOn, setAiCursorOn] = useState(true);
+  const [nowTick, setNowTick] = useState(Date.now());
   const aiIsTyping = Boolean(aiTargetText) && aiTypedText.length < aiTargetText.length;
+
+  function toggleWeeklyTrainingDay(day: string) {
+    setGoal((prev) => {
+      const existing = (prev.training_days || []).map((d) => String(d).toLowerCase().slice(0, 3));
+      const isSelected = existing.includes(day);
+      const next = isSelected ? existing.filter((d) => d !== day) : [...existing, day];
+      return {
+        ...prev,
+        training_days: next,
+        weekly_activity_goal_total: next.length,
+      };
+    });
+  }
 
   useEffect(() => {
     if (goalData) setGoal(goalData);
   }, [goalData]);
+  useEffect(() => {
+    if (!profileData) return;
+    setGoal((prev) => {
+      if (Array.isArray(prev.training_days) && prev.training_days.length > 0) return prev;
+      const fromProfile = ((profileData?.schedule || {}).training_days || []) as string[];
+      if (!fromProfile.length) return prev;
+      return {
+        ...prev,
+        training_days: fromProfile.map((d) => String(d).toLowerCase().slice(0, 3)),
+        weekly_activity_goal_total: Number(prev.weekly_activity_goal_total || fromProfile.length),
+      };
+    });
+  }, [profileData]);
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
 
   const week = useMemo(() => getWeekRange(new Date()), []);
   const weeklyCounts = useMemo(() => weeklyActivityCountsBySport(activities || [], week), [activities, week]);
@@ -136,6 +180,9 @@ export function PlanPage() {
         weekly_activity_goal_run: Number(goal.weekly_activity_goal_run || 0),
         weekly_activity_goal_swim: Number(goal.weekly_activity_goal_swim || 0),
         weekly_activity_goal_ride: Number(goal.weekly_activity_goal_ride || 0),
+        training_days: goal.training_days || [],
+        weekly_plan_generation_day: (goal.weekly_plan_generation_day || 'sun').toString().slice(0, 3),
+        weekly_plan_generation_hour: Number(goal.weekly_plan_generation_hour ?? 2),
       }),
     onSuccess: async () => {
       qc.invalidateQueries({ queryKey: ['goal'] });
@@ -199,7 +246,30 @@ export function PlanPage() {
   }, [goal?.event_date]);
 
   const progressScore = Math.max(8, Math.min(95, Math.round(weeklyCounts.total * 14 + distance28d / 4)));
-  const trainingDays = ((profileData?.schedule || {}).training_days || []) as string[];
+  const trainingDays = (goal.training_days || ((profileData?.schedule || {}).training_days || [])) as string[];
+  const nextAutoGeneration = useMemo(() => {
+    const day = String(goal.weekly_plan_generation_day || 'sun').slice(0, 3).toLowerCase();
+    const hour = Math.max(0, Math.min(23, Number(goal.weekly_plan_generation_hour ?? 2)));
+    const now = new Date(nowTick);
+    const map: Record<string, number> = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 0 };
+    const targetDow = map[day] ?? 0;
+    const candidate = new Date(now);
+    candidate.setMinutes(0, 0, 0);
+    candidate.setHours(hour);
+    const diff = (targetDow - now.getDay() + 7) % 7;
+    candidate.setDate(now.getDate() + diff);
+    if (candidate.getTime() <= now.getTime()) candidate.setDate(candidate.getDate() + 7);
+    return candidate;
+  }, [goal.weekly_plan_generation_day, goal.weekly_plan_generation_hour, nowTick]);
+  const autoGenerationCountdown = useMemo(() => {
+    const deltaMs = Math.max(0, nextAutoGeneration.getTime() - nowTick);
+    const sec = Math.floor(deltaMs / 1000);
+    const days = Math.floor(sec / 86400);
+    const hours = Math.floor((sec % 86400) / 3600);
+    const mins = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    return `${days}d ${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }, [nextAutoGeneration, nowTick]);
   const goalSummaryCards = useMemo(() => {
     const cards: Array<{ label: string; value: string }> = [{ label: 'Goal type', value: typeLabel(goal) }];
     if (goal.type === 'race') {
@@ -343,13 +413,12 @@ export function PlanPage() {
           </Button>
         </div>
         {aiPanelOpen && (
-          <div className='mt-3 rounded-xl border border-cyan-400/40 bg-cyan-500/10 p-3'>
-            <p className='text-xs uppercase tracking-wide text-cyan-200/90'>AI Response</p>
+          <AiCallout className='mt-3' title='AI Response'>
             <p className='mt-2 min-h-6 text-sm text-cyan-50'>
               {aiTypedText}
               {aiIsTyping ? <span className={`${aiCursorOn ? 'opacity-100' : 'opacity-0'} transition-opacity`}>|</span> : null}
             </p>
-          </div>
+          </AiCallout>
         )}
       </Card>
 
@@ -374,6 +443,10 @@ export function PlanPage() {
             <div className='rounded-xl border border-border p-3'><p className='text-xs text-muted-foreground'>Swim</p><p className='text-2xl font-semibold'>{goal.weekly_activity_goal_swim || 0}</p></div>
             <div className='rounded-xl border border-border p-3'><p className='text-xs text-muted-foreground'>Ride</p><p className='text-2xl font-semibold'>{goal.weekly_activity_goal_ride || 0}</p></div>
             <div className='rounded-xl border border-border p-3'><p className='text-xs text-muted-foreground'>Progress this week</p><p className='text-2xl font-semibold'>{weeklyCounts.total}/{goal.weekly_activity_goal_total || 0}</p></div>
+            <div className='rounded-xl border border-border p-3 md:col-span-2 lg:col-span-5'>
+              <p className='text-xs text-muted-foreground'>Training days</p>
+              <p className='text-base font-semibold'>{formatDays(trainingDays)}</p>
+            </div>
           </div>
         ) : (
           <>
@@ -395,6 +468,51 @@ export function PlanPage() {
                 <Input type='number' value={goal.weekly_activity_goal_ride ?? 0} onChange={(e) => setGoal((p) => ({ ...p, weekly_activity_goal_ride: Number(e.target.value || 0) }))} />
               </label>
             </div>
+            <div className='mt-4 space-y-2'>
+              <p className='text-sm text-muted-foreground'>Training days (used by AI weekly planning)</p>
+              <div className='grid grid-cols-4 gap-2 sm:grid-cols-7'>
+                {TRAINING_DAYS.map((d) => {
+                  const selected = (goal.training_days || []).includes(d.key);
+                  return (
+                    <button
+                      key={d.key}
+                      type='button'
+                      onClick={() => toggleWeeklyTrainingDay(d.key)}
+                      className={`rounded-xl border px-3 py-2 text-sm transition ${
+                        selected
+                          ? 'border-emerald-400/60 bg-emerald-500/15 text-emerald-200'
+                          : 'border-border bg-muted/25 text-muted-foreground hover:border-cyan-400/40'
+                      }`}
+                    >
+                      {d.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div className='mt-4 grid gap-4 md:grid-cols-2'>
+              <label className='space-y-1'>
+                <span className='text-sm text-muted-foreground'>Auto-generate next week on</span>
+                <select
+                  className='h-10 w-full rounded-xl border border-border bg-background px-3 text-sm'
+                  value={String(goal.weekly_plan_generation_day || 'sun').slice(0, 3)}
+                  onChange={(e) => setGoal((p) => ({ ...p, weekly_plan_generation_day: e.target.value as 'sat' | 'sun' }))}
+                >
+                  <option value='sat'>Saturday</option>
+                  <option value='sun'>Sunday</option>
+                </select>
+              </label>
+              <label className='space-y-1'>
+                <span className='text-sm text-muted-foreground'>Auto-generate hour (0-23)</span>
+                <Input
+                  type='number'
+                  min={0}
+                  max={23}
+                  value={goal.weekly_plan_generation_hour ?? 2}
+                  onChange={(e) => setGoal((p) => ({ ...p, weekly_plan_generation_hour: Math.max(0, Math.min(23, Number(e.target.value || 0))) }))}
+                />
+              </label>
+            </div>
             <div className='mt-3 flex items-center gap-2'>
               <div className={`rounded-xl border px-3 py-1.5 text-sm ${splitValid ? 'border-emerald-400/40 text-emerald-300' : 'border-rose-400/40 text-rose-300'}`}>
                 {splitValid ? 'Sport split is valid' : 'Run + Swim + Ride cannot exceed total'}
@@ -403,6 +521,9 @@ export function PlanPage() {
             </div>
           </>
         )}
+        <div className='mt-3 rounded-xl border border-cyan-400/30 bg-cyan-500/10 px-3 py-2 text-sm text-cyan-100'>
+          Next auto-generation: {nextAutoGeneration.toLocaleString()} ({autoGenerationCountdown})
+        </div>
       </Card>
 
       <Card className='p-6'>
