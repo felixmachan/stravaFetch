@@ -98,12 +98,36 @@ function PaceTooltip({ active, payload }: any) {
   );
 }
 
+function PowerTooltip({ active, payload }: any) {
+  if (!active || !payload?.length) return null;
+  const point = payload[0].payload || {};
+  return (
+    <div className='rounded-xl border border-slate-600/50 bg-slate-950/95 px-3 py-2 text-xs text-slate-100 shadow-xl'>
+      <p className='font-semibold text-slate-200'>{formatClock(Number(point.t || 0))}</p>
+      <p className='mt-1'>Power: <span className='font-semibold'>{Math.round(Number(point.watts || 0))} W</span></p>
+    </div>
+  );
+}
+
+function HrPaceTooltip({ active, payload }: any) {
+  if (!active || !payload?.length) return null;
+  const point = payload[0]?.payload || {};
+  return (
+    <div className='rounded-xl border border-slate-600/50 bg-slate-950/95 px-3 py-2 text-xs text-slate-100 shadow-xl'>
+      <p className='font-semibold text-slate-200'>{formatClock(Number(point.t || 0))}</p>
+      {point.hr != null ? <p className='mt-1'>HR: <span className='font-semibold'>{Math.round(Number(point.hr))} bpm</span></p> : null}
+      {point.pace != null ? <p className='mt-1'>Pace: <span className='font-semibold'>{formatPace(Number(point.pace || 0))}</span></p> : null}
+    </div>
+  );
+}
+
 export function ActivityDetailPage() {
   const params = useParams();
   const id = params.id;
   const navigate = useNavigate();
   const qc = useQueryClient();
   const [quickAi, setQuickAi] = useState('');
+  const [hrPaceMode, setHrPaceMode] = useState<'pace' | 'hr' | 'combined'>('combined');
 
   const { data } = useQuery({ queryKey: ['activity', id], queryFn: async () => (await api.get(`/activities/${id}`)).data, enabled: Boolean(id) });
   const syncNow = useMutation({
@@ -150,62 +174,68 @@ export function ActivityDetailPage() {
   const hasHrData = chartData.some((d) => d.hr != null);
   const hasAltData = chartData.some((d) => d.alt != null);
   const isSwim = String(data?.type || '').toLowerCase().includes('swim');
-  const paceSeries = useMemo(() => {
+  const hrPaceSeries = useMemo(() => {
     const distance = (data?.streams?.distance || []) as number[];
     const time = (data?.streams?.time || []) as number[];
+    const hr = (data?.streams?.heartrate || []) as number[];
     const len = Math.min(distance.length, time.length);
-    if (len < 3) return [] as Array<{ x: number; t: number; pace: number }>;
+    if (len < 2) return [] as Array<{ t: number; hr: number | null; pace: number | null; pace_plot: number | null }>;
     const bucketSec = 10;
-    const bucketed: Array<{ x: number; t: number; pace: number }> = [];
+    const fallbackPace = pacePerKm(Number(data?.distance_m || 0), Number(data?.moving_time_s || 0)) || 360;
+    let lastHr = hr.find((x) => x != null) ?? (data?.avg_hr ?? null);
+    let emaPace = fallbackPace;
+    const out: Array<{ t: number; hr: number | null; pace: number | null }> = [];
     let startIdx = 0;
-
     for (let i = 1; i < len; i += 1) {
       const elapsed = Number(time[i] || 0) - Number(time[startIdx] || 0);
       if (elapsed < bucketSec) continue;
-      const dDelta = Number(distance[i] || 0) - Number(distance[startIdx] || 0);
-      const tDelta = elapsed;
-      const x = Number((Number(distance[i] || 0) / 1000).toFixed(2));
-      const t = Number(time[i] || 0);
-      if (dDelta > 5 && tDelta > 0) {
-        const pace = tDelta / (dDelta / 1000);
-        if (Number.isFinite(pace) && pace >= 120 && pace <= 1200) {
-          bucketed.push({ x, t, pace });
+      const dt = elapsed;
+      const dd = Number(distance[i] || 0) - Number(distance[startIdx] || 0);
+      let paceCandidate: number | null = null;
+      if (dt > 0 && dd > 2) {
+        const p = dt / (dd / 1000);
+        if (Number.isFinite(p) && p >= 120 && p <= 1200) {
+          const lower = emaPace * 0.55;
+          const upper = emaPace * 1.6;
+          paceCandidate = Math.max(lower, Math.min(upper, p));
         }
       }
+      if (paceCandidate != null) emaPace = (emaPace * 0.82) + (paceCandidate * 0.18);
+      let hrSum = 0;
+      let hrCount = 0;
+      for (let j = startIdx; j <= i; j += 1) {
+        if (hr[j] != null) {
+          hrSum += Number(hr[j]);
+          hrCount += 1;
+        }
+      }
+      const hrValue = hrCount > 0 ? (hrSum / hrCount) : (lastHr ?? null);
+      if (hrValue != null) lastHr = hrValue;
+      out.push({ t: Number(time[i] || 0), hr: hrValue, pace: Number(emaPace.toFixed(1)) });
       startIdx = i;
     }
-
-    const smoothWindow = 1;
-    return bucketed.map((point, idx) => {
-      const start = Math.max(0, idx - smoothWindow);
-      const end = Math.min(bucketed.length - 1, idx + smoothWindow);
-      let sum = 0;
-      let count = 0;
-      for (let j = start; j <= end; j += 1) {
-        sum += bucketed[j].pace;
-        count += 1;
-      }
-      return { x: point.x, t: point.t, pace: Number((sum / Math.max(1, count)).toFixed(1)) };
-    });
+    const paceValues = out.map((x) => Number(x.pace || 0)).filter((x) => Number.isFinite(x) && x > 0);
+    if (!paceValues.length) {
+      return out.map((x) => ({ ...x, pace_plot: null }));
+    }
+    const minP = Math.max(120, Math.floor(Math.min(...paceValues) - Math.max(8, (Math.max(...paceValues) - Math.min(...paceValues)) * 0.1)));
+    const maxP = Math.min(1200, Math.ceil(Math.max(...paceValues) + Math.max(8, (Math.max(...paceValues) - Math.min(...paceValues)) * 0.1)));
+    return out.map((x) => ({
+      ...x,
+      pace_plot: x.pace != null ? (maxP - Number(x.pace) + minP) : null,
+    }));
   }, [data]);
-  const hasPaceData = paceSeries.length > 0;
-  const paceDomain = useMemo<[number, number]>(() => {
-    const p = paceSeries.map((x) => x.pace).filter((x) => Number.isFinite(x));
+  const hasPaceData = hrPaceSeries.some((x) => x.pace != null);
+  const hrPaceDomain = useMemo<[number, number]>(() => {
+    const p = hrPaceSeries.map((x) => Number(x.pace || 0)).filter((x) => Number.isFinite(x) && x > 0);
     if (!p.length) return [240, 480];
     const minP = Math.min(...p);
     const maxP = Math.max(...p);
-    const pad = Math.max(10, (maxP - minP) * 0.12);
+    const pad = Math.max(8, (maxP - minP) * 0.1);
     return [Math.max(120, Math.floor(minP - pad)), Math.min(1200, Math.ceil(maxP + pad))];
-  }, [paceSeries]);
-  const paceChartData = useMemo(
-    () =>
-      paceSeries.map((pt) => ({
-        ...pt,
-        pace_plot: paceDomain[1] - pt.pace + paceDomain[0],
-      })),
-    [paceSeries, paceDomain]
-  );
-  const paceTickFromPlot = (v: number) => paceDomain[1] - Number(v) + paceDomain[0];
+  }, [hrPaceSeries]);
+  const paceTickFromPlot = (v: number) => hrPaceDomain[1] - Number(v) + hrPaceDomain[0];
+  const hasHrPaceCombinedData = hrPaceSeries.some((x) => x.hr != null || x.pace != null);
 
   const splits = useMemo(() => {
     const rawSplits = data?.raw_payload?.splits_metric || [];
@@ -243,7 +273,33 @@ export function ActivityDetailPage() {
     ? Number(data?.moving_time_s || 0) / (Number(data?.distance_m || 0) / 100)
     : 0;
   const cadence = data?.streams?.cadence || [];
-  const avgCadence = cadence.length ? cadence.reduce((s: number, c: number) => s + c, 0) / cadence.length : null;
+  const avgCadence = cadence.length
+    ? cadence.reduce((s: number, c: number) => s + c, 0) / cadence.length
+    : (Number((data?.average_cadence ?? data?.raw_payload?.average_cadence) || 0) || null);
+  const watts = data?.streams?.watts || [];
+  const avgWatts = watts.length
+    ? watts.reduce((sum: number, w: number) => sum + Number(w || 0), 0) / Math.max(1, watts.length)
+    : (Number((data?.average_watts ?? data?.raw_payload?.average_watts) || 0) || null);
+  const maxWatts = watts.length
+    ? Math.max(...watts.map((w: number) => Number(w || 0)))
+    : (Number((data?.max_watts ?? data?.raw_payload?.max_watts) || 0) || null);
+  const powerSeries = useMemo(() => {
+    const power = (data?.streams?.watts || []) as number[];
+    const time = (data?.streams?.time || []) as number[];
+    const len = Math.min(power.length, time.length);
+    if (!len) return [] as Array<{ t: number; watts: number }>;
+    return Array.from({ length: len }).map((_, i) => ({
+      t: Number(time[i] || 0),
+      watts: Number(power[i] || 0),
+    }));
+  }, [data]);
+  const hasPowerData = powerSeries.some((x) => Number.isFinite(x.watts) && x.watts > 0);
+  const bestEfforts = Array.isArray(data?.raw_payload?.best_efforts) ? data.raw_payload.best_efforts : [];
+  const achievementCount = Number((data?.achievement_count ?? data?.raw_payload?.achievement_count) || 0);
+  const kudosCount = Number((data?.kudos_count ?? data?.raw_payload?.kudos_count) || 0);
+  const highlightedKudosers = Array.isArray(data?.raw_payload?.highlighted_kudosers) ? data.raw_payload.highlighted_kudosers : [];
+  const fallbackKudosPreview = Array.isArray(data?.raw_payload?.kudos_preview) ? data.raw_payload.kudos_preview : [];
+  const kudosPreview = highlightedKudosers.length ? highlightedKudosers : fallbackKudosPreview;
   useEffect(() => {
     if (data?.activity_reaction?.text_summary) {
       setQuickAi(data.activity_reaction.text_summary);
@@ -272,7 +328,37 @@ export function ActivityDetailPage() {
           <div><p className='text-sm text-muted-foreground'>Time</p><p className='text-3xl font-semibold'>{formatDuration(data.moving_time_s)}</p></div>
           <div><p className='text-sm text-muted-foreground'>Avg pace</p><p className='text-3xl font-semibold'>{formatPace(pacePerKm(data.distance_m, data.moving_time_s))}</p></div>
           <div><p className='text-sm text-muted-foreground'>Avg HR</p><p className='text-3xl font-semibold'>{data.avg_hr ? Math.round(data.avg_hr) : 'n/a'}</p></div>
+          <div><p className='text-sm text-muted-foreground'>Avg Power</p><p className='text-3xl font-semibold'>{avgWatts ? `${Math.round(avgWatts)} W` : 'n/a'}</p></div>
+          <div><p className='text-sm text-muted-foreground'>Max Power</p><p className='text-3xl font-semibold'>{maxWatts ? `${Math.round(maxWatts)} W` : 'n/a'}</p></div>
+          <div><p className='text-sm text-muted-foreground'>Achievements</p><p className='text-3xl font-semibold'>{achievementCount}</p></div>
         </div>
+        <div className='mt-5 flex flex-wrap items-center gap-3 text-sm text-muted-foreground'>
+          <span className='font-medium'>Kudos: {kudosCount}</span>
+          {kudosPreview.slice(0, 6).map((k: any, idx: number) => {
+            const img = k?.avatar_url || k?.profile_medium || k?.profile || '';
+            const label =
+              k?.display_name
+              || `${k?.firstname || ''} ${k?.lastname || ''}`.trim()
+              || `Athlete ${idx + 1}`;
+            return (
+              <div key={`${k?.id || idx}`} className='flex items-center gap-1 rounded-full border border-border px-2 py-1'>
+                {img ? (
+                  <img src={img} alt={label} className='h-5 w-5 rounded-full object-cover' />
+                ) : (
+                  <div className='grid h-5 w-5 place-items-center rounded-full bg-muted text-[10px] text-foreground'>
+                    {label.slice(0, 1).toUpperCase()}
+                  </div>
+                )}
+                <span className='text-xs'>{label}</span>
+              </div>
+            );
+          })}
+        </div>
+        {!data?.fully_synced && (
+          <p className='mt-4 text-sm text-amber-300'>
+            Detailed sync in progress{data?.sync_error ? ` (${data.sync_error})` : ''}.
+          </p>
+        )}
       </Card>
 
       <div>
@@ -367,26 +453,26 @@ export function ActivityDetailPage() {
         <>
           <div className='grid gap-4 md:grid-cols-2'>
             <Card className='h-72 p-4'>
-              <p className='text-base font-semibold'>Heart Rate</p>
+              <p className='text-base font-semibold'>Power</p>
               <div className='mt-3 h-[220px] rounded-xl'>
-                {hasHrData ? (
+                {hasPowerData ? (
                   <ResponsiveContainer width='100%' height='100%'>
-                    <AreaChart data={chartData}>
+                    <AreaChart data={powerSeries}>
                       <defs>
-                        <linearGradient id='hrGradient' x1='0' y1='0' x2='0' y2='1'>
-                          <stop offset='0%' stopColor='#fb7185' stopOpacity={0.65} />
-                          <stop offset='100%' stopColor='#fb7185' stopOpacity={0.05} />
+                        <linearGradient id='powerGradient' x1='0' y1='0' x2='0' y2='1'>
+                          <stop offset='0%' stopColor='#a3e635' stopOpacity={0.45} />
+                          <stop offset='100%' stopColor='#a3e635' stopOpacity={0.06} />
                         </linearGradient>
                       </defs>
                       <CartesianGrid strokeDasharray='4 4' stroke='hsl(var(--border))' />
                       <XAxis dataKey='t' tickFormatter={(v) => formatClock(Number(v))} minTickGap={28} />
                       <YAxis />
-                      <ChartTooltip content={<MetricTooltip />} />
-                      <Area type='monotone' dataKey='hr' stroke='#fb7185' fill='url(#hrGradient)' strokeWidth={2.2} />
+                      <ChartTooltip content={<PowerTooltip />} />
+                      <Area type='monotone' dataKey='watts' stroke='#a3e635' dot={false} strokeWidth={2.2} fill='url(#powerGradient)' />
                     </AreaChart>
                   </ResponsiveContainer>
                 ) : (
-                  <div className='grid h-full place-items-center text-sm text-muted-foreground'>No heart-rate stream yet.</div>
+                  <div className='grid h-full place-items-center text-sm text-muted-foreground'>No power stream yet.</div>
                 )}
               </div>
             </Card>
@@ -417,26 +503,49 @@ export function ActivityDetailPage() {
           </div>
 
           <Card className='h-72 p-4'>
-            <p className='text-base font-semibold'>Pace Trend</p>
+            <div className='mb-2 flex items-center justify-between gap-3'>
+              <p className='text-base font-semibold'>Heart Rate & Pace</p>
+              <select
+                className='h-9 rounded-lg border border-border bg-background px-2 text-sm'
+                value={hrPaceMode}
+                onChange={(e) => setHrPaceMode((e.target.value as 'pace' | 'hr' | 'combined'))}
+              >
+                <option value='pace'>Pace</option>
+                <option value='hr'>HR</option>
+                <option value='combined'>Combined</option>
+              </select>
+            </div>
             <div className='mt-3 h-[220px] rounded-xl'>
-              {hasPaceData ? (
+              {hasHrPaceCombinedData ? (
                 <ResponsiveContainer width='100%' height='100%'>
-                  <AreaChart data={paceChartData}>
+                  <AreaChart data={hrPaceSeries}>
                     <defs>
-                      <linearGradient id='paceGradient' x1='0' y1='0' x2='0' y2='1'>
-                        <stop offset='0%' stopColor='#22d3ee' stopOpacity={0.42} />
-                        <stop offset='100%' stopColor='#22d3ee' stopOpacity={0.06} />
+                      <linearGradient id='hrCombinedGradient' x1='0' y1='0' x2='0' y2='1'>
+                        <stop offset='0%' stopColor='#fb7185' stopOpacity={0.55} />
+                        <stop offset='100%' stopColor='#fb7185' stopOpacity={0.04} />
+                      </linearGradient>
+                      <linearGradient id='paceCombinedGradient' x1='0' y1='0' x2='0' y2='1'>
+                        <stop offset='0%' stopColor='#22d3ee' stopOpacity={0.45} />
+                        <stop offset='100%' stopColor='#22d3ee' stopOpacity={0.05} />
                       </linearGradient>
                     </defs>
                     <CartesianGrid strokeDasharray='4 4' stroke='hsl(var(--border))' />
                     <XAxis dataKey='t' tickFormatter={(v) => formatClock(Number(v))} minTickGap={28} />
-                    <YAxis domain={paceDomain} tickFormatter={(v) => formatPaceTick(paceTickFromPlot(Number(v)))} />
-                    <ChartTooltip content={<PaceTooltip />} />
-                    <Area type='monotone' dataKey='pace_plot' stroke='#22d3ee' dot={false} strokeWidth={2.2} fill='url(#paceGradient)' />
+                    {(hrPaceMode === 'hr' || hrPaceMode === 'combined') && <YAxis yAxisId='hr' orientation='left' />}
+                    {(hrPaceMode === 'pace' || hrPaceMode === 'combined') && (
+                      <YAxis yAxisId='pace' orientation='right' domain={hrPaceDomain} tickFormatter={(v) => formatPaceTick(paceTickFromPlot(Number(v)))} />
+                    )}
+                    <ChartTooltip content={<HrPaceTooltip />} />
+                    {(hrPaceMode === 'hr' || hrPaceMode === 'combined') && (
+                      <Area yAxisId='hr' type='monotone' dataKey='hr' stroke='#fb7185' dot={false} strokeWidth={2.1} fill='url(#hrCombinedGradient)' connectNulls />
+                    )}
+                    {(hrPaceMode === 'pace' || hrPaceMode === 'combined') && (
+                      <Area yAxisId='pace' type='monotone' dataKey='pace_plot' stroke='#22d3ee' dot={false} strokeWidth={2.1} fill='url(#paceCombinedGradient)' connectNulls />
+                    )}
                   </AreaChart>
                 </ResponsiveContainer>
               ) : (
-                <div className='grid h-full place-items-center text-sm text-muted-foreground'>No pace stream yet.</div>
+                <div className='grid h-full place-items-center text-sm text-muted-foreground'>No HR/Pace stream yet.</div>
               )}
             </div>
           </Card>
@@ -444,6 +553,36 @@ export function ActivityDetailPage() {
       )}
 
       <div className='grid gap-4 md:grid-cols-2'>
+        <Card className='p-4'>
+          <div className='flex items-center justify-between'>
+            <p className='text-base font-semibold'>Achievements</p>
+            <Badge>{achievementCount}</Badge>
+          </div>
+          {bestEfforts.length ? (
+            <div className='mt-3 max-h-64 overflow-y-auto'>
+              <table className='w-full text-sm'>
+                <thead className='text-muted-foreground'>
+                  <tr>
+                    <th className='py-1 text-left'>Name</th>
+                    <th className='py-1 text-left'>PR rank</th>
+                    <th className='py-1 text-left'>Elapsed</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bestEfforts.slice(0, 12).map((effort: any, idx: number) => (
+                    <tr key={`${effort?.id || idx}`} className='border-t border-border'>
+                      <td className='py-1'>{String(effort?.name || effort?.activity?.name || `Effort ${idx + 1}`)}</td>
+                      <td className='py-1'>{effort?.pr_rank ? `#${effort.pr_rank}` : 'n/a'}</td>
+                      <td className='py-1'>{formatDuration(Number(effort?.elapsed_time || 0))}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className='mt-3 text-sm text-muted-foreground'>No best-effort data available for this activity.</div>
+          )}
+        </Card>
         <Card className='p-4'>
           <div className='flex items-center justify-between'>
             <p className='text-base font-semibold'>Splits</p>

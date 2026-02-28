@@ -75,6 +75,20 @@ export function ActivitiesPage() {
                   <p className='text-xl font-semibold'>{formatPace(pacePerKm(activity.distance_m, activity.moving_time_s))}</p>
                 </div>
               </div>
+              <div className='mt-3 flex flex-wrap gap-2 text-xs'>
+                <span className='rounded-lg border border-border px-2 py-1 text-muted-foreground'>
+                  Achievements: {Number(activity.achievement_count || activity?.raw_payload?.achievement_count || 0)}
+                </span>
+                <span className='rounded-lg border border-border px-2 py-1 text-muted-foreground'>
+                  Kudos: {Number(activity.kudos_count || activity?.raw_payload?.kudos_count || 0)}
+                </span>
+                <span className='rounded-lg border border-border px-2 py-1 text-muted-foreground'>
+                  Power: {(activity.average_watts ?? activity?.raw_payload?.average_watts) ? `${Math.round(Number(activity.average_watts ?? activity?.raw_payload?.average_watts))} W` : 'n/a'}
+                </span>
+                <span className='rounded-lg border border-border px-2 py-1 text-muted-foreground'>
+                  Sync: {activity.fully_synced ? 'Detailed' : 'Summary'}
+                </span>
+              </div>
             </Card>
           </Link>
         ))}

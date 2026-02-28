@@ -62,6 +62,7 @@ function buildInitialRegisterForm() {
       annual_km_goal: '',
       ai_memory_days: '30',
       training_days: ['mon', 'wed', 'fri'] as string[],
+      import_from_date: '',
       strava_signup_token: '',
     };
   }
@@ -84,6 +85,7 @@ function buildInitialRegisterForm() {
     annual_km_goal: '',
     ai_memory_days: '10',
     training_days: ['tue', 'thu', 'fri', 'sun'] as string[],
+    import_from_date: '',
     strava_signup_token: '',
   };
 }
@@ -103,6 +105,7 @@ export function LoginPage() {
   const [error, setError] = useState('');
   const [stravaLinkedForSignup, setStravaLinkedForSignup] = useState(false);
   const [stravaAvatar, setStravaAvatar] = useState('');
+  const todayIso = useMemo(() => toIsoDate(new Date()), []);
 
   const [loginForm, setLoginForm] = useState({ usernameOrEmail: '', password: '' });
   const [registerForm, setRegisterForm] = useState(buildInitialRegisterForm);
@@ -277,6 +280,7 @@ export function LoginPage() {
         goal_target_time_min: registerForm.goal_target_time_min ? Number(registerForm.goal_target_time_min) : null,
         annual_km_goal: registerForm.annual_km_goal ? Number(registerForm.annual_km_goal) : null,
         ai_memory_days: registerForm.ai_memory_days ? Number(registerForm.ai_memory_days) : 30,
+        import_from_date: registerForm.import_from_date || null,
       });
       setOnboardingGate(true);
       setRegisterProgress((p) => Math.max(p, 14));
@@ -490,6 +494,16 @@ export function LoginPage() {
                 <label className='space-y-1'>
                   <span className='text-xs font-medium uppercase tracking-wide text-muted-foreground'>AI memory window (days)</span>
                   <Input type='number' placeholder='30' value={registerForm.ai_memory_days} onChange={(e) => setRegisterForm((p) => ({ ...p, ai_memory_days: e.target.value }))} />
+                </label>
+                <label className='space-y-1'>
+                  <span className='text-xs font-medium uppercase tracking-wide text-muted-foreground'>Import from date</span>
+                  <Input
+                    type='date'
+                    max={todayIso}
+                    value={registerForm.import_from_date}
+                    onChange={(e) => setRegisterForm((p) => ({ ...p, import_from_date: e.target.value }))}
+                  />
+                  <span className='text-xs text-muted-foreground'>Import activities from this date onward.</span>
                 </label>
               </div>
 

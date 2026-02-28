@@ -556,6 +556,15 @@ def register_view(request):
     if User.objects.filter(email__iexact=email).exists():
         return Response({"detail": "Email already taken"}, status=400)
     goal_type = str(request.data.get("goal_type") or "").strip().lower()
+    import_from_date_raw = str(request.data.get("import_from_date") or "").strip()
+    import_from_date = None
+    if import_from_date_raw:
+        try:
+            import_from_date = dt.date.fromisoformat(import_from_date_raw)
+        except Exception:
+            return Response({"detail": "Import from date must be in YYYY-MM-DD format."}, status=400)
+        if import_from_date > timezone.localdate():
+            return Response({"detail": "Import from date cannot be in the future."}, status=400)
     if goal_type == "race":
         if not request.data.get("goal_event_name") or not request.data.get("goal_event_date"):
             return Response({"detail": "Race goal requires event name and event date."}, status=400)
@@ -569,6 +578,7 @@ def register_view(request):
         "full_sync_complete": False,
         "last_full_sync_at": None,
     }
+    schedule["import_from_date"] = import_from_date.isoformat() if import_from_date else None
     profile.schedule = schedule
     profile.save(update_fields=["schedule"])
     signup_token = (request.data.get("strava_signup_token") or "").strip()
@@ -599,11 +609,11 @@ def register_view(request):
             inline_sync = os.getenv("STRAVA_SYNC_INLINE_ON_CONNECT", "0") == "1"
             if inline_sync:
                 try:
-                    sync_now_for_user(user.id)
+                    sync_now_for_user(user.id, import_from_date_iso=(import_from_date.isoformat() if import_from_date else None))
                 except Exception:
                     pass
             else:
-                sync_now_for_user.delay(user.id)
+                sync_now_for_user.delay(user.id, import_from_date_iso=(import_from_date.isoformat() if import_from_date else None))
         except Exception:
             pass
     _run_background(lambda: generate_onboarding_summary(user, bootstrap_last_n=10))
@@ -622,6 +632,8 @@ def onboarding_status_view(request):
     has_strava = bool(strava)
     full_sync_complete = bool(onboarding.get("full_sync_complete"))
     sync_in_progress = bool(onboarding.get("sync_in_progress"))
+    recent_10_total = int(onboarding.get("recent_10_total") or 0)
+    recent_10_fully_synced = int(onboarding.get("recent_10_fully_synced") or 0)
     last_sync_result = onboarding.get("last_sync_result") if isinstance(onboarding.get("last_sync_result"), dict) else {}
     sync_failed = bool(last_sync_result.get("failed"))
     sync_error = str(last_sync_result.get("error") or "")
@@ -659,7 +671,10 @@ def onboarding_status_view(request):
     if has_strava and not full_sync_complete:
         progress = 35
         message = "Syncing all Strava activities"
-        details = ["Loading your full activity history"]
+        if recent_10_total > 0:
+            details = [f"Syncing latest activities: {recent_10_fully_synced}/{recent_10_total} complete"]
+        else:
+            details = ["Loading your full activity history"]
     if full_sync_complete:
         progress = 50
         message = "All Strava data loaded"
@@ -697,9 +712,11 @@ def onboarding_status_view(request):
             "sync_error": sync_error,
             "next_week_plan_ready": has_next_week_plan,
             "recent_ai_complete": None,
-            "recent_activity_count": 0,
+            "recent_activity_count": recent_10_total,
             "recent_ai_note_count": 0,
-            "reaction_progress": 0,
+            "reaction_progress": int(round((recent_10_fully_synced / max(1, recent_10_total)) * 100)) if recent_10_total else 0,
+            "recent_10_total": recent_10_total,
+            "recent_10_fully_synced": recent_10_fully_synced,
             "has_onboarding": has_onboarding,
             "has_weekly_summary": has_weekly_summary,
             "has_quick_encouragement": has_quick_encouragement,
@@ -980,7 +997,18 @@ def activities(request):
 @api_view(["GET"])
 def activity_detail(request, pk):
     activity = Activity.objects.get(pk=pk, user=request.user)
-    if not ActivityStream.objects.filter(activity=activity).exists():
+    stream_row = ActivityStream.objects.filter(activity=activity).values("raw_streams").first()
+    stream_payload = (stream_row or {}).get("raw_streams") or {}
+    best_efforts = (activity.raw_payload or {}).get("best_efforts") if isinstance(activity.raw_payload, dict) else []
+    needs_enrich = (
+        request.GET.get("refresh") == "1"
+        or not stream_row
+        or not activity.fully_synced
+        or not best_efforts
+        or not isinstance(stream_payload.get("watts"), list)
+        or not isinstance(stream_payload.get("grade_smooth"), list)
+    )
+    if needs_enrich:
         conn = StravaConnection.objects.filter(user=request.user).first()
         if conn:
             try:
@@ -988,6 +1016,7 @@ def activity_detail(request, pk):
                 sync_streams_for_activity(request.user, activity, token)
             except Exception:
                 pass
+            activity.refresh_from_db()
     data = ActivitySerializer(activity).data
     stream = ActivityStream.objects.filter(activity=activity).values("raw_streams").first()
     metrics = DerivedMetrics.objects.filter(activity=activity).values().first()
@@ -1003,6 +1032,12 @@ def activity_detail(request, pk):
     if not ranges:
         ranges = {"Z1": "<120 bpm", "Z2": "120-139 bpm", "Z3": "140-159 bpm", "Z4": "160-174 bpm", "Z5": "175+ bpm"}
     data["streams"] = stream["raw_streams"] if stream else {}
+    data["streams_available"] = sorted(
+        [
+            key for key, values in (stream["raw_streams"] if stream else {}).items()
+            if isinstance(values, list) and values
+        ]
+    )
     data["derived_metrics"] = metrics or {}
     data["hr_zone_ranges"] = ranges
     data["coach_note"] = CoachNote.objects.filter(activity=activity).order_by("-created_at").values().first()

@@ -16,6 +16,41 @@ from .services.ai_coach import (
 from .services.strava import refresh_if_needed, sync_athlete_profile_from_connection
 
 
+def _summary_defaults(user, a):
+    return {
+        'user': user,
+        'type': a.get('type', 'Other'),
+        'sport_type': a.get('sport_type') or '',
+        'name': a.get('name', 'Activity'),
+        'start_date': a['start_date'],
+        'start_date_local': a.get('start_date_local'),
+        'timezone_name': a.get('timezone') or '',
+        'distance_m': a.get('distance', 0),
+        'moving_time_s': a.get('moving_time', 0),
+        'elapsed_time_s': a.get('elapsed_time', 0),
+        'total_elevation_gain_m': a.get('total_elevation_gain', 0),
+        'average_speed_mps': a.get('average_speed', 0),
+        'max_speed_mps': a.get('max_speed', 0),
+        'average_cadence': a.get('average_cadence'),
+        'average_watts': a.get('average_watts'),
+        'weighted_average_watts': a.get('weighted_average_watts'),
+        'avg_hr': a.get('average_heartrate'),
+        'max_hr': a.get('max_heartrate'),
+        'calories': a.get('calories'),
+        'suffer_score': a.get('suffer_score'),
+        'achievement_count': int(a.get('achievement_count') or 0),
+        'kudos_count': int(a.get('kudos_count') or 0),
+        'comment_count': int(a.get('comment_count') or 0),
+        'device_name': a.get('device_name') or '',
+        'trainer': bool(a.get('trainer')),
+        'commute': bool(a.get('commute')),
+        'manual': bool(a.get('manual')),
+        'map_summary_polyline': a.get('map', {}).get('summary_polyline'),
+        'raw_payload': a,
+        'is_deleted': False,
+    }
+
+
 @shared_task
 def poll_strava_activities():
     for conn in StravaConnection.objects.select_related('user').all():
@@ -105,7 +140,7 @@ def generate_activity_reaction_task(activity_id, user_id):
 
 
 @shared_task
-def sync_now_for_user(user_id):
+def sync_now_for_user(user_id, import_from_date_iso=None):
     user = User.objects.get(id=user_id)
     conn = StravaConnection.objects.get(user=user)
     profile, _ = AthleteProfile.objects.get_or_create(user=user)
@@ -127,51 +162,115 @@ def sync_now_for_user(user_id):
     upserted = 0
     new_activities = 0
     max_activities = 30
+    import_from_date = None
     sync_failed = False
     sync_error = ""
     synced_strava_ids = []
+    parsed_activities = 0
+    selected_activities = 0
+    import_from_schedule = str((profile.schedule or {}).get("import_from_date") or "").strip()
+    import_from_value = str(import_from_date_iso or import_from_schedule or "").strip()
+    if import_from_value:
+        try:
+            import_from_date = dt.date.fromisoformat(import_from_value)
+            max_activities = None
+        except Exception:
+            import_from_date = None
+
+    def _activity_date(activity_payload):
+        raw_start = str(activity_payload.get("start_date") or "").strip()
+        if not raw_start:
+            return None
+        normalized = raw_start.replace("Z", "+00:00")
+        try:
+            return dt.datetime.fromisoformat(normalized).date()
+        except Exception:
+            return None
+
     try:
-        r = requests.get(
-            'https://www.strava.com/api/v3/athlete/activities',
-            headers={'Authorization': f'Bearer {token}'},
-            params={'per_page': max_activities, 'page': 1},
-            timeout=30,
-        )
-        if r.status_code == 429:
-            sync_failed = True
-            sync_error = "strava_rate_limited"
+        if import_from_date:
+            # Backfill mode for onboarding: walk pages until we pass the cutoff date.
+            per_page = 100
+            page = 1
+            while True:
+                r = requests.get(
+                    'https://www.strava.com/api/v3/athlete/activities',
+                    headers={'Authorization': f'Bearer {token}'},
+                    params={'per_page': per_page, 'page': page},
+                    timeout=30,
+                )
+                if r.status_code == 429:
+                    sync_failed = True
+                    sync_error = "strava_rate_limited"
+                    break
+                r.raise_for_status()
+                batch = r.json() or []
+                if not batch:
+                    break
+                fetched += len(batch)
+                stop_after_batch = False
+                for a in batch:
+                    parsed_activities += 1
+                    activity_date = _activity_date(a)
+                    if activity_date and activity_date < import_from_date:
+                        stop_after_batch = True
+                        continue
+                    selected_activities += 1
+                    obj, created = Activity.objects.update_or_create(
+                        strava_activity_id=a['id'],
+                        defaults=_summary_defaults(user, a),
+                    )
+                    synced_strava_ids.append(int(a['id']))
+                    try:
+                        sync_streams_for_activity(user, obj, token)
+                    except Exception:
+                        # Keep activity row even if stream sync fails.
+                        pass
+                    upserted += 1
+                    if created:
+                        new_activities += 1
+                if stop_after_batch or len(batch) < per_page:
+                    break
+                page += 1
         else:
-            r.raise_for_status()
-            items = r.json() or []
-            # Defensive sort to ensure newest-first ordering.
-            items = sorted(items, key=lambda x: str(x.get('start_date') or ''), reverse=True)[:max_activities]
-            fetched = len(items)
-            for a in items:
-                obj, created = Activity.objects.update_or_create(strava_activity_id=a['id'], defaults={
-                    'user': user, 'type': a.get('type', 'Other'), 'name': a.get('name', 'Activity'),
-                    'start_date': a['start_date'], 'distance_m': a.get('distance', 0), 'moving_time_s': a.get('moving_time', 0),
-                    'elapsed_time_s': a.get('elapsed_time', 0), 'total_elevation_gain_m': a.get('total_elevation_gain', 0),
-                    'average_speed_mps': a.get('average_speed', 0), 'max_speed_mps': a.get('max_speed', 0),
-                    'avg_hr': a.get('average_heartrate'), 'max_hr': a.get('max_heartrate'), 'calories': a.get('calories'),
-                    'suffer_score': a.get('suffer_score'), 'map_summary_polyline': a.get('map', {}).get('summary_polyline'),
-                    'raw_payload': a, 'is_deleted': False,
-                })
-                synced_strava_ids.append(int(a['id']))
-                try:
-                    sync_streams_for_activity(user, obj, token)
-                except Exception:
-                    # Keep activity row even if stream sync fails.
-                    pass
-                upserted += 1
-                if created:
-                    new_activities += 1
+            # Regular polling mode: keep request light.
+            r = requests.get(
+                'https://www.strava.com/api/v3/athlete/activities',
+                headers={'Authorization': f'Bearer {token}'},
+                params={'per_page': max_activities, 'page': 1},
+                timeout=30,
+            )
+            if r.status_code == 429:
+                sync_failed = True
+                sync_error = "strava_rate_limited"
+            else:
+                r.raise_for_status()
+                items = r.json() or []
+                # Defensive sort to ensure newest-first ordering.
+                items = sorted(items, key=lambda x: str(x.get('start_date') or ''), reverse=True)[:max_activities]
+                fetched = len(items)
+                parsed_activities = len(items)
+                selected_activities = len(items)
+                for a in items:
+                    obj, created = Activity.objects.update_or_create(
+                        strava_activity_id=a['id'],
+                        defaults=_summary_defaults(user, a),
+                    )
+                    synced_strava_ids.append(int(a['id']))
+                    try:
+                        sync_streams_for_activity(user, obj, token)
+                    except Exception:
+                        # Keep activity row even if stream sync fails.
+                        pass
+                    upserted += 1
+                    if created:
+                        new_activities += 1
     except Exception as exc:
         sync_failed = True
         sync_error = str(exc)[:250]
 
-    if not sync_failed and synced_strava_ids:
-        # Keep only the latest synced set visible for this user.
-        Activity.objects.filter(user=user, is_deleted=False).exclude(strava_activity_id__in=synced_strava_ids).update(is_deleted=True)
+    # Do not hard-delete or hide non-polled historical rows here.
+    # Poll windows can be partial (e.g., date-based import) and should not mark other activities deleted.
 
     conn.last_sync_at = timezone.now()
     conn.last_polled_at = timezone.now()
@@ -182,17 +281,30 @@ def sync_now_for_user(user_id):
     profile, _ = AthleteProfile.objects.get_or_create(user=user)
     schedule = profile.schedule or {}
     onboarding = schedule.get("onboarding", {})
+    recent_ids = list(
+        Activity.objects.filter(user=user, is_deleted=False)
+        .order_by("-start_date")
+        .values_list("id", flat=True)[:10]
+    )
+    recent_total = len(recent_ids)
+    recent_fully_synced = Activity.objects.filter(id__in=recent_ids, fully_synced=True).count() if recent_ids else 0
+    full_sync_complete = bool((not sync_failed) and (recent_total == 0 or recent_fully_synced == recent_total))
     onboarding["sync_in_progress"] = False
-    onboarding["full_sync_complete"] = not sync_failed
+    onboarding["full_sync_complete"] = full_sync_complete
     onboarding["last_full_sync_at"] = timezone.now().isoformat()
     onboarding["last_sync_result"] = {
         "fetched": fetched,
         "upserted": upserted,
         "new_activities": new_activities,
         "max_activities": max_activities,
+        "import_from_date": import_from_date.isoformat() if import_from_date else None,
+        "parsed_activities": parsed_activities,
+        "selected_activities": selected_activities,
         "failed": sync_failed,
         "error": sync_error,
     }
+    onboarding["recent_10_total"] = recent_total
+    onboarding["recent_10_fully_synced"] = recent_fully_synced
     schedule["onboarding"] = onboarding
     profile.schedule = schedule
     profile.save(update_fields=["schedule"])
@@ -207,6 +319,12 @@ def sync_now_for_user(user_id):
         'failed': sync_failed,
         'error': sync_error,
         'max_activities': max_activities,
+        'import_from_date': import_from_date.isoformat() if import_from_date else None,
+        'parsed_activities': parsed_activities,
+        'selected_activities': selected_activities,
+        'full_sync_complete': full_sync_complete,
+        'recent_10_total': recent_total,
+        'recent_10_fully_synced': recent_fully_synced,
     }
 
 
@@ -248,36 +366,87 @@ def _hr_zones(heartrate, hr_zones=None):
 def sync_streams_for_activity(user, activity, token):
     profile, _ = AthleteProfile.objects.get_or_create(user=user)
     detail_url = f"https://www.strava.com/api/v3/activities/{activity.strava_activity_id}"
-    detail_resp = requests.get(detail_url, headers={'Authorization': f'Bearer {token}'}, params={'include_all_efforts': 'false'}, timeout=30)
+    detail_ok = False
+    detail_resp = requests.get(detail_url, headers={'Authorization': f'Bearer {token}'}, params={'include_all_efforts': 'true'}, timeout=30)
     if detail_resp.ok:
+        detail_ok = True
         detail = detail_resp.json()
         raw_payload = activity.raw_payload or {}
+        raw_payload['description'] = detail.get('description')
+        raw_payload['gear_id'] = detail.get('gear_id')
+        raw_payload['average_temp'] = detail.get('average_temp')
+        raw_payload['elev_high'] = detail.get('elev_high')
+        raw_payload['elev_low'] = detail.get('elev_low')
+        raw_payload['average_cadence'] = detail.get('average_cadence')
+        raw_payload['average_watts'] = detail.get('average_watts')
+        raw_payload['max_watts'] = detail.get('max_watts')
+        raw_payload['weighted_average_watts'] = detail.get('weighted_average_watts')
+        raw_payload['kilojoules'] = detail.get('kilojoules')
+        raw_payload['kudos_count'] = detail.get('kudos_count', raw_payload.get('kudos_count', 0))
+        raw_payload['comment_count'] = detail.get('comment_count', raw_payload.get('comment_count', 0))
+        raw_payload['achievement_count'] = detail.get('achievement_count', raw_payload.get('achievement_count', 0))
         raw_payload['splits_metric'] = detail.get('splits_metric', raw_payload.get('splits_metric', []))
         raw_payload['splits_standard'] = detail.get('splits_standard', raw_payload.get('splits_standard', []))
+        raw_payload['best_efforts'] = detail.get('best_efforts', raw_payload.get('best_efforts', []))
+        raw_payload['segment_efforts'] = detail.get('segment_efforts', raw_payload.get('segment_efforts', []))
+        raw_payload['highlighted_kudosers'] = detail.get('highlighted_kudosers', raw_payload.get('highlighted_kudosers', []))
         activity.raw_payload = raw_payload
-        activity.save(update_fields=['raw_payload'])
+        activity.description = detail.get('description') or activity.description
+        activity.gear_id = detail.get('gear_id') or ''
+        activity.average_temp = detail.get('average_temp')
+        activity.elev_high = detail.get('elev_high')
+        activity.elev_low = detail.get('elev_low')
+        activity.average_cadence = detail.get('average_cadence')
+        activity.average_watts = detail.get('average_watts')
+        activity.max_watts = detail.get('max_watts')
+        activity.weighted_average_watts = detail.get('weighted_average_watts')
+        activity.kilojoules = detail.get('kilojoules')
+        activity.kudos_count = int(detail.get('kudos_count') or activity.kudos_count or 0)
+        activity.comment_count = int(detail.get('comment_count') or activity.comment_count or 0)
+        activity.achievement_count = int(detail.get('achievement_count') or activity.achievement_count or 0)
+        activity.avg_hr = detail.get('average_heartrate') if detail.get('average_heartrate') is not None else activity.avg_hr
+        activity.max_hr = detail.get('max_heartrate') if detail.get('max_heartrate') is not None else activity.max_hr
+        activity.calories = detail.get('calories') if detail.get('calories') is not None else activity.calories
+        activity.detail_synced_at = timezone.now()
+        activity.save(update_fields=[
+            'raw_payload', 'description', 'gear_id', 'average_temp', 'elev_high', 'elev_low',
+            'average_cadence', 'average_watts', 'max_watts', 'weighted_average_watts', 'kilojoules',
+            'kudos_count', 'comment_count', 'achievement_count', 'avg_hr', 'max_hr', 'calories', 'detail_synced_at'
+        ])
 
     stream_url = f"https://www.strava.com/api/v3/activities/{activity.strava_activity_id}/streams"
     params = {
-        'keys': 'time,distance,heartrate,altitude,latlng,cadence',
+        'keys': 'time,latlng,distance,altitude,velocity_smooth,heartrate,cadence,watts,temp,moving,grade_smooth',
         'key_by_type': 'true',
     }
     r = requests.get(stream_url, headers={'Authorization': f'Bearer {token}'}, params=params, timeout=30)
     if r.status_code in (401, 404):
+        activity.fully_synced = False
+        activity.sync_error = f"stream_http_{r.status_code}"
+        activity.save(update_fields=['fully_synced', 'sync_error'])
         return
     r.raise_for_status()
     payload = r.json() or {}
     streams = {k: v.get('data', []) for k, v in payload.items() if isinstance(v, dict)}
     heartrate = streams.get('heartrate', [])
     distance = streams.get('distance', [])
+    stream_types = sorted([k for k, v in streams.items() if isinstance(v, list) and v])
+    sample_count = max([len(v) for v in streams.values() if isinstance(v, list)] or [0])
 
     ActivityStream.objects.update_or_create(
         activity=activity,
         defaults={
             'raw_streams': streams,
+            'stream_types': stream_types,
+            'sample_count': sample_count,
             'has_latlng': bool(streams.get('latlng')),
             'has_hr': bool(heartrate),
             'has_cadence': bool(streams.get('cadence')),
+            'has_power': bool(streams.get('watts')),
+            'has_temp': bool(streams.get('temp')),
+            'has_velocity': bool(streams.get('velocity_smooth')),
+            'has_grade': bool(streams.get('grade_smooth')),
+            'has_moving': bool(streams.get('moving')),
         },
     )
     pace = None
@@ -292,6 +461,39 @@ def sync_streams_for_activity(user, activity, token):
             'hr_zone_distribution': _hr_zones(heartrate, profile.hr_zones),
         },
     )
+    activity.streams_synced_at = timezone.now()
+    activity.fully_synced = bool(detail_ok)
+    activity.sync_error = "" if detail_ok else "detail_sync_failed"
+    try:
+        has_highlighted_kudosers = bool((activity.raw_payload or {}).get("highlighted_kudosers"))
+        # Small social preview for UI: who gave kudos.
+        if not has_highlighted_kudosers:
+            kudos_resp = requests.get(
+                f"https://www.strava.com/api/v3/activities/{activity.strava_activity_id}/kudos",
+                headers={'Authorization': f'Bearer {token}'},
+                params={'page': 1, 'per_page': 8},
+                timeout=20,
+            )
+            if kudos_resp.ok:
+                preview = []
+                for athlete in (kudos_resp.json() or []):
+                    if not isinstance(athlete, dict):
+                        continue
+                    preview.append(
+                        {
+                            "id": athlete.get("id"),
+                            "firstname": athlete.get("firstname") or "",
+                            "lastname": athlete.get("lastname") or "",
+                            "profile": athlete.get("profile"),
+                            "profile_medium": athlete.get("profile_medium"),
+                        }
+                    )
+                payload = activity.raw_payload or {}
+                payload["kudos_preview"] = preview
+                activity.raw_payload = payload
+    except Exception:
+        pass
+    activity.save(update_fields=['streams_synced_at', 'fully_synced', 'sync_error', 'raw_payload'])
 
 
 @shared_task
