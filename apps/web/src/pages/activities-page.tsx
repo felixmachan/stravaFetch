@@ -1,4 +1,4 @@
-import { Bike, PersonStanding, Search, Waves } from '../components/ui/icons';
+import { Bike, Footprint, PersonStanding, Search, Waves } from '../components/ui/icons';
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -12,6 +12,7 @@ import { Skeleton } from '../components/ui/skeleton';
 function SportIcon({ type }: { type: string }) {
   const lower = type.toLowerCase();
   if (lower.includes('run')) return <PersonStanding className='h-8 w-8 text-red-400' />;
+  if (lower.includes('walk') || lower.includes('hike')) return <Footprint className='h-8 w-8 text-emerald-400' />;
   if (lower.includes('ride') || lower.includes('bike')) return <Bike className='h-8 w-8 text-sky-400' />;
   if (lower.includes('swim')) return <Waves className='h-8 w-8 text-cyan-300' />;
   return <PersonStanding className='h-8 w-8 text-zinc-400' />;

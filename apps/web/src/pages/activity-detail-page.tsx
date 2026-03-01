@@ -7,7 +7,7 @@ import { LatLngBounds } from 'leaflet';
 import { api } from '../lib/api';
 import { formatDuration, formatPace, km, pacePerKm } from '../lib/analytics';
 import { decodePolyline } from '../lib/polyline';
-import { Bike, PersonStanding, Waves } from '../components/ui/icons';
+import { Bike, Footprint, PersonStanding, Waves } from '../components/ui/icons';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Card } from '../components/ui/card';
@@ -143,6 +143,7 @@ function kudosAvatarUrl(k: any): string {
 function SportIcon({ type }: { type: string }) {
   const lower = (type || '').toLowerCase();
   if (lower.includes('run')) return <PersonStanding className='h-8 w-8 text-red-400' />;
+  if (lower.includes('walk') || lower.includes('hike')) return <Footprint className='h-8 w-8 text-emerald-400' />;
   if (lower.includes('ride') || lower.includes('bike')) return <Bike className='h-8 w-8 text-sky-400' />;
   if (lower.includes('swim')) return <Waves className='h-8 w-8 text-cyan-300' />;
   return <PersonStanding className='h-8 w-8 text-zinc-400' />;
